@@ -26,3 +26,6 @@ Thumbs.db
 
 # Local architecture review artifact
 /architecture_diff_history.txt
+
+# Local broker credentials
+/.secrets/
