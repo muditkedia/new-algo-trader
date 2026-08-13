@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+
+# Market/backtest data
+data/
+results/
+logs/
+*.parquet
+*.duckdb
+*.db
+*.xlsx
+
+# Test/tool caches
+.pytest_cache/
+.ruff_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
