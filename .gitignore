@@ -8,7 +8,7 @@ __pycache__/
 .env.*
 
 # Market/backtest data
-data/
+/data/
 results/
 logs/
 *.parquet

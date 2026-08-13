@@ -9,7 +9,11 @@ description = "Algorithmic-trading platform for intraday Indian equities"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "duckdb>=1,<2",
+    "polars>=1,<2",
     "pydantic>=2,<3",
+    "pyarrow>=25,<26",
+    "tzdata>=2025.2",
 ]
 
 [tool.pytest.ini_options]
@@ -23,4 +27,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
