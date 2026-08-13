@@ -4,15 +4,7 @@ from __future__ import annotations
 
 import polars as pl
 
-REQUIRED_CANDLE_COLUMNS = (
-    "timestamp",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "symbol",
-)
+from algo_trader.data import CANONICAL_CANDLE_COLUMNS
 
 
 def validate_strategy_input(candles: pl.DataFrame) -> None:
@@ -24,7 +16,7 @@ def validate_strategy_input(candles: pl.DataFrame) -> None:
     if not isinstance(candles, pl.DataFrame):
         raise TypeError("candles must be a Polars DataFrame")
 
-    missing = [column for column in REQUIRED_CANDLE_COLUMNS if column not in candles.columns]
+    missing = [column for column in CANONICAL_CANDLE_COLUMNS if column not in candles.columns]
     if missing:
         raise ValueError(f"missing required candle column(s): {', '.join(missing)}")
 
@@ -43,4 +35,3 @@ def validate_strategy_input(candles: pl.DataFrame) -> None:
         raise ValueError("strategy timestamps must not contain duplicates")
     if not timestamps.is_sorted(descending=False):
         raise ValueError("strategy timestamps must be in ascending order")
-

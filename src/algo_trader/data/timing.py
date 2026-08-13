@@ -1,4 +1,4 @@
-"""Helpers for candle-information availability timing."""
+"""Canonical candle timing semantics."""
 
 from datetime import datetime, timedelta
 
@@ -12,4 +12,3 @@ def bar_available_at(bar_start: datetime, timeframe_minutes: int = 5) -> datetim
     if timeframe_minutes <= 0:
         raise ValueError("timeframe_minutes must be positive")
     return bar_start + timedelta(minutes=timeframe_minutes)
-

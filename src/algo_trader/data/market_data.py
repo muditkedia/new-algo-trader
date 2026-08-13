@@ -15,7 +15,15 @@ from pydantic import BaseModel, ConfigDict
 MARKET_TIMEZONE_NAME = "Asia/Kolkata"
 MARKET_TIMEZONE = ZoneInfo(MARKET_TIMEZONE_NAME)
 
-_CANDLE_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume", "symbol")
+CANONICAL_CANDLE_COLUMNS = (
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "symbol",
+)
 
 
 class MarketDataConfig(BaseModel):
@@ -123,7 +131,7 @@ class ParquetMarketDataStore:
             ).arrow()
             candles = pl.from_arrow(arrow_result.read_all())
 
-        return candles.select(_CANDLE_COLUMNS)
+        return candles.select(CANONICAL_CANDLE_COLUMNS)
 
     def _normalize_symbols(self, symbols: Iterable[str]) -> list[str]:
         selected = sorted(set(symbols))

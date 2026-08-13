@@ -7,7 +7,8 @@ import polars as pl
 import pytest
 
 from algo_trader import Side, Signal, SignalStatus
-from algo_trader.strategies import Strategy, bar_available_at, validate_strategy_input
+from algo_trader.data import bar_available_at
+from algo_trader.strategies import Strategy, validate_strategy_input
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
@@ -150,4 +151,3 @@ def test_strategy_protocol_and_generated_signal_contract() -> None:
         "source_bar_start": candles["timestamp"].item(-1),
         "close": 103.0,
     }
-
