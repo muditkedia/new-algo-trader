@@ -108,6 +108,19 @@ class DomainModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+class ProtectiveExitSpec(DomainModel):
+    """Broker-neutral protective stop/target intent for an open position."""
+
+    stop_price: PositiveDecimal | None = None
+    target_price: PositiveDecimal | None = None
+
+    @model_validator(mode="after")
+    def require_protective_price(self) -> ProtectiveExitSpec:
+        if self.stop_price is None and self.target_price is None:
+            raise ValueError("at least one of stop_price or target_price is required")
+        return self
+
+
 class Signal(DomainModel):
     """A strategy decision containing only information known when generated."""
 
@@ -173,7 +186,7 @@ class Fill(DomainModel):
     timestamp: AwareDateTime
     price: PositiveDecimal
     quantity: int = Field(strict=True, gt=0)
-    slippage_per_unit: FiniteDecimal = Decimal("0")
+    slippage_per_unit: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] = Decimal("0")
     is_simulated: bool
 
 

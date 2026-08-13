@@ -6,6 +6,7 @@ from algo_trader.domain import (
     MLScore,
     OrderIntent,
     OrderType,
+    ProtectiveExitSpec,
     Side,
     Signal,
     SignalStatus,
@@ -18,9 +19,9 @@ __all__ = [
     "MLScore",
     "OrderIntent",
     "OrderType",
+    "ProtectiveExitSpec",
     "Side",
     "Signal",
     "SignalStatus",
     "Trade",
 ]
-

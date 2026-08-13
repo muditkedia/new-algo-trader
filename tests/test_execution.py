@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 from algo_trader import OrderIntent, OrderType, Side, Signal
-from algo_trader.execution import HistoricalExecutionSimulator
+from algo_trader.execution import FixedBasisPointsSlippage, HistoricalExecutionSimulator
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
@@ -218,3 +218,52 @@ def test_empty_valid_candle_frame_returns_none() -> None:
     candles = make_candles().clear()
 
     assert HistoricalExecutionSimulator().fill_entry_order(make_order(), candles) is None
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_price"),
+    [(Side.LONG, Decimal("100.10")), (Side.SHORT, Decimal("99.90"))],
+)
+def test_market_entry_applies_exact_adverse_slippage(
+    side: Side,
+    expected_price: Decimal,
+) -> None:
+    candles = make_candles(opens=[90.0, 100.0, 102.0])
+    simulator = HistoricalExecutionSimulator(
+        slippage_model=FixedBasisPointsSlippage(Decimal("10"))
+    )
+
+    fill = simulator.fill_entry_order(make_order(side=side), candles)
+
+    assert fill is not None
+    assert fill.price == expected_price
+    assert fill.slippage_per_unit == Decimal("0.10")
+
+
+@pytest.mark.parametrize(
+    ("side", "open_price", "expected_price"),
+    [
+        (Side.LONG, 98.0, Decimal("98.098")),
+        (Side.SHORT, 102.0, Decimal("101.898")),
+    ],
+)
+def test_limit_entry_selects_improved_raw_price_before_slippage(
+    side: Side,
+    open_price: float,
+    expected_price: Decimal,
+) -> None:
+    candles = make_candles(opens=[100.0, open_price, 103.0])
+    simulator = HistoricalExecutionSimulator(
+        slippage_model=FixedBasisPointsSlippage(Decimal("10"))
+    )
+    order = make_order(
+        side=side,
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("100"),
+    )
+
+    fill = simulator.fill_entry_order(order, candles)
+
+    assert fill is not None
+    assert fill.price == expected_price
+    assert fill.slippage_per_unit == abs(expected_price - Decimal(str(open_price)))

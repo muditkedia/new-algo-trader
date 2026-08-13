@@ -4,7 +4,16 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from algo_trader import ExitReason, Fill, MLScore, Side, Signal, SignalStatus, Trade
+from algo_trader import (
+    ExitReason,
+    Fill,
+    MLScore,
+    ProtectiveExitSpec,
+    Side,
+    Signal,
+    SignalStatus,
+    Trade,
+)
 
 NOW = datetime(2025, 1, 2, 9, 20, tzinfo=timezone(timedelta(hours=5, minutes=30)))
 
@@ -272,3 +281,26 @@ def test_signal_snapshots_are_detached_and_immutable() -> None:
     assert signal.strategy_parameters["periods"] == (5, 20)
     with pytest.raises(TypeError):
         signal.strategy_parameters["new"] = 1  # type: ignore[index]
+
+
+def test_protective_exit_requires_at_least_one_price() -> None:
+    with pytest.raises(ValidationError, match="at least one"):
+        ProtectiveExitSpec()
+
+
+@pytest.mark.parametrize("field", ["stop_price", "target_price"])
+@pytest.mark.parametrize("price", [Decimal("0"), Decimal("-1")])
+def test_protective_exit_prices_must_be_positive(field: str, price: Decimal) -> None:
+    with pytest.raises(ValidationError):
+        ProtectiveExitSpec(**{field: price})
+
+
+def test_fill_rejects_negative_slippage() -> None:
+    with pytest.raises(ValidationError):
+        Fill(
+            timestamp=NOW,
+            price=Decimal("100"),
+            quantity=1,
+            slippage_per_unit=Decimal("-0.01"),
+            is_simulated=True,
+        )
