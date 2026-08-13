@@ -23,3 +23,6 @@ logs/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Local architecture review artifact
+/architecture_diff_history.txt
