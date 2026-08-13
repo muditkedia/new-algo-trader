@@ -13,6 +13,7 @@ dependencies = [
     "polars>=1,<2",
     "pydantic>=2,<3",
     "pyarrow>=25,<26",
+    "TA-Lib>=0.7,<0.8",
     "tzdata>=2025.2",
 ]
 
