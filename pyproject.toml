@@ -10,11 +10,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1,<2",
+    "lightgbm>=4.7,<5",
     "matplotlib>=3.11,<4",
     "openpyxl>=3.1,<4",
+    "optuna>=4.9,<5",
     "polars>=1,<2",
     "pydantic>=2,<3",
     "pyarrow>=25,<26",
+    "scikit-learn>=1.9,<2",
     "TA-Lib>=0.7,<0.8",
     "tzdata>=2025.2",
 ]
