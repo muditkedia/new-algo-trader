@@ -1,0 +1,179 @@
+manifest_version = 1
+
+[[component]]
+distribution_name = "APScheduler"
+import_name = "apscheduler"
+category = "RUNTIME_COMMUNITY"
+role = "Runtime per-date scheduling."
+project_evidence = ["src/algo_trader/runtime/scheduler.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares MIT."
+
+[[component]]
+distribution_name = "duckdb"
+import_name = "duckdb"
+category = "RUNTIME_COMMUNITY"
+role = "Historical market-data querying; OOS registry; Runtime persistence."
+project_evidence = [
+    "src/algo_trader/data/market_data.py",
+    "src/algo_trader/oos/registry.py",
+    "src/algo_trader/runtime/state.py",
+]
+license_status = "MIT"
+license_metadata_note = "Installed metadata includes the MIT license classifier."
+
+[[component]]
+distribution_name = "lightgbm"
+import_name = "lightgbm"
+category = "RUNTIME_COMMUNITY"
+role = "Trade Meta-Model classifier/regressor."
+project_evidence = ["src/algo_trader/ml/meta_model.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares the MIT license expression."
+
+[[component]]
+distribution_name = "logzero"
+import_name = "logzero"
+category = "RUNTIME_COMMUNITY"
+role = "Official SmartAPI SDK support dependency."
+project_evidence = ["src/algo_trader/broker/angel_one.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares MIT."
+
+[[component]]
+distribution_name = "matplotlib"
+import_name = "matplotlib"
+category = "RUNTIME_COMMUNITY"
+role = "Deterministic PNG reporting."
+project_evidence = ["src/algo_trader/reporting/outputs.py"]
+license_status = "MATPLOTLIB-LICENSE"
+license_metadata_note = "Installed metadata supplies the Matplotlib license and PSF classifier."
+
+[[component]]
+distribution_name = "openpyxl"
+import_name = "openpyxl"
+category = "RUNTIME_COMMUNITY"
+role = "Excel derivative reports/native charts."
+project_evidence = ["src/algo_trader/reporting/outputs.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares MIT."
+
+[[component]]
+distribution_name = "optuna"
+import_name = "optuna"
+category = "RUNTIME_COMMUNITY"
+role = "Sparse multi-objective Strategy Optimizer."
+project_evidence = ["src/algo_trader/ml/optimizer.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata includes the MIT license classifier."
+
+[[component]]
+distribution_name = "polars"
+import_name = "polars"
+category = "RUNTIME_COMMUNITY"
+role = "Canonical in-memory/tabular candle/report data."
+project_evidence = ["src/algo_trader/data/market_data.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata supplies the MIT license and classifier."
+
+[[component]]
+distribution_name = "pydantic"
+import_name = "pydantic"
+category = "RUNTIME_COMMUNITY"
+role = "Immutable validated domain/config models."
+project_evidence = ["src/algo_trader/domain.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares the MIT license expression."
+
+[[component]]
+distribution_name = "pyarrow"
+import_name = "pyarrow"
+category = "RUNTIME_COMMUNITY"
+role = "Parquet/Arrow market-data interoperability."
+project_evidence = ["src/algo_trader/data/market_data.py"]
+license_status = "APACHE-2.0"
+license_metadata_note = "Installed metadata declares Apache-2.0."
+
+[[component]]
+distribution_name = "pyotp"
+import_name = "pyotp"
+category = "RUNTIME_COMMUNITY"
+role = "Deterministic SmartAPI TOTP generation."
+project_evidence = ["src/algo_trader/broker/angel_one.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares the MIT license expression."
+
+[[component]]
+distribution_name = "python-dotenv"
+import_name = "dotenv"
+category = "RUNTIME_COMMUNITY"
+role = "Explicit SmartAPI.env parsing using dotenv_values."
+project_evidence = ["src/algo_trader/runtime/credentials.py"]
+license_status = "BSD-3-CLAUSE"
+license_metadata_note = "Installed metadata declares BSD-3-Clause."
+
+[[component]]
+distribution_name = "scikit-learn"
+import_name = "sklearn"
+category = "RUNTIME_COMMUNITY"
+role = "Probability calibration / LogisticRegression."
+project_evidence = ["src/algo_trader/ml/meta_model.py"]
+license_status = "BSD-3-CLAUSE"
+license_metadata_note = "Installed metadata declares BSD-3-Clause."
+
+[[component]]
+distribution_name = "smartapi-python"
+import_name = "SmartApi"
+category = "RUNTIME_VENDOR"
+role = "Official Angel One Broker SDK boundary."
+project_evidence = [
+    "src/algo_trader/broker/angel_one.py",
+    "src/algo_trader/broker/market_data.py",
+]
+license_status = "VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED"
+license_metadata_note = "Required vendor SDK; installed metadata does not declare a license."
+
+[[component]]
+distribution_name = "TA-Lib"
+import_name = "talib"
+category = "RUNTIME_COMMUNITY"
+role = "Technical indicator primitives."
+project_evidence = ["src/algo_trader/indicators/talib_indicators.py"]
+license_status = "BSD-2-CLAUSE"
+license_metadata_note = "Wheel metadata omits license fields but includes a local LICENSE file."
+
+[[component]]
+distribution_name = "tzdata"
+import_name = "tzdata"
+category = "RUNTIME_COMMUNITY"
+role = "ZoneInfo timezone database fallback, especially relevant on Windows."
+project_evidence = ["src/algo_trader/data/timing.py"]
+license_status = "APACHE-2.0"
+license_metadata_note = "Installed metadata declares Apache-2.0."
+
+[[component]]
+distribution_name = "websocket-client"
+import_name = "websocket"
+category = "RUNTIME_COMMUNITY"
+role = "Official SmartAPI websocket dependency."
+project_evidence = ["src/algo_trader/broker/market_data.py"]
+license_status = "APACHE-2.0"
+license_metadata_note = "Installed metadata declares Apache-2.0."
+
+[[component]]
+distribution_name = "pytest"
+import_name = "pytest"
+category = "DEV_TOOL"
+role = "Automated architecture/unit tests."
+project_evidence = ["tests/test_domain.py"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares the MIT license expression."
+
+[[component]]
+distribution_name = "ruff"
+executable_name = "ruff"
+category = "DEV_TOOL"
+role = "Lint/import/style gate."
+project_evidence = ["pyproject.toml"]
+license_status = "MIT"
+license_metadata_note = "Installed metadata declares the MIT license expression."

@@ -28,6 +28,12 @@ dependencies = [
     "websocket-client>=1.9,<2",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.16,<0.17",
+]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = ["src"]
