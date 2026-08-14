@@ -1048,38 +1048,61 @@ class RuntimeService:
             broker_entry_fill_ids=entry_fill_ids,
             broker_exit_fill_ids=broker_exit_fill_ids,
         )
-        self.state_store.close_position(position)
-        self.state_store.save_trade(record)
-        self.state_store.update_allocation_status(
-            self.runtime_session_id, position.candidate_fingerprint, "CLOSED"
+        terminal_position = position.model_copy(
+            update={"exit_lifecycle": RuntimeExitLifecycle.FILLED}
         )
-        self.state_store.append_event(
-            self.runtime_session_id,
-            exit_result.fill.timestamp,
-            "TRADE_CLOSED",
-            f"candidate={position.candidate_fingerprint};shadow={position.is_shadow}",
-        )
-        if not position.is_shadow:
+        if self._session is None:
+            raise RuntimeError("Runtime session has not started")
+        proposed_capital = self._economic_capital
+        proposed_session = self._session
+        proposed_portfolio_state = self._portfolio_state
+        try:
+            if not position.is_shadow:
+                proposed_capital += trade.net_pnl
+                proposed_session = self._session.model_copy(
+                    update={"current_capital": proposed_capital}
+                )
+                released_state = self.capital_allocator.release(
+                    self._portfolio_state, position.reservation
+                )
+                proposed_portfolio_state = released_state
+                if proposed_capital > 0:
+                    proposed_portfolio_state = PortfolioState(
+                        capital_limit=proposed_capital,
+                        active_reservations=released_state.active_reservations,
+                    )
+            self.state_store.finalize_completed_trade(
+                terminal_position,
+                record,
+                proposed_session,
+                exit_result.fill.timestamp,
+            )
+        except Exception as error:
+            try:
+                self.halt(
+                    "completed-trade atomic finalization failed",
+                    exit_result.fill.timestamp,
+                )
+            except Exception as halt_error:
+                error.add_note(
+                    "Runtime HALT persistence also failed: "
+                    f"{type(halt_error).__name__}: {halt_error}"
+                )
+            raise
+
+        if position.is_shadow or self.config.mode is RuntimeMode.PAPER:
+            self._paper_gateway.publish_completed_position(
+                position.candidate_fingerprint
+            )
+        else:
             self._live_positions.pop(position.candidate_fingerprint, None)
-            self._release_decision(position.allocation_decision)
-            self._economic_capital += trade.net_pnl
-            if self._economic_capital > 0:
-                self._portfolio_state = PortfolioState(
-                    capital_limit=self._economic_capital,
-                    active_reservations=self._portfolio_state.active_reservations,
-                )
-            else:
-                self.halt("modeled economic capital is exhausted", exit_result.fill.timestamp)
-            if self._session is not None:
-                self._session = self._session.model_copy(
-                    update={"current_capital": self._economic_capital}
-                )
-                self.state_store.update_session(
-                    self._session,
-                    occurred_at=exit_result.fill.timestamp,
-                    event_type="CAPITAL_UPDATED",
-                    description=f"current_capital={self._economic_capital}",
-                )
+        if position.is_shadow:
+            return record
+        self._portfolio_state = proposed_portfolio_state
+        self._economic_capital = proposed_capital
+        self._session = proposed_session
+        if proposed_capital <= 0:
+            self.halt("modeled economic capital is exhausted", exit_result.fill.timestamp)
         return record
 
     def _release_decision(self, decision: AllocationDecision) -> None:

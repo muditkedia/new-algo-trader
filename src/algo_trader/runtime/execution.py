@@ -135,13 +135,15 @@ class PaperExecutionGateway:
                     self._positions[fingerprint] = updated
                     self.state_store.save_position(updated)
                 continue
-            self._positions.pop(fingerprint)
             terminal = updated.model_copy(
                 update={"exit_lifecycle": RuntimeExitLifecycle.FILLED}
             )
-            self.state_store.close_position(terminal)
             closed.append((terminal, result))
         return PaperTickResult(opened=tuple(opened), closed=tuple(closed))
+
+    def publish_completed_position(self, fingerprint: str) -> None:
+        """Remove a position from memory only after durable trade finalization."""
+        self._positions.pop(fingerprint, None)
 
     def request_exit(
         self,

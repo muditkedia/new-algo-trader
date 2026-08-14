@@ -13,9 +13,15 @@ import duckdb
 from pydantic import BaseModel
 
 from algo_trader.broker import BrokerOrderSnapshot, BrokerTradeFill
-from algo_trader.portfolio import AllocationDecision, CapitalReservation
+from algo_trader.portfolio import (
+    AllocationDecision,
+    AllocationOutcome,
+    CapitalReservation,
+)
+from algo_trader.runtime.identity import candidate_fingerprint
 from algo_trader.runtime.models import (
     RuntimeEvent,
+    RuntimeExitLifecycle,
     RuntimeOrderLifecycle,
     RuntimeOrderRecord,
     RuntimePositionRecord,
@@ -518,6 +524,223 @@ class RuntimeStateStore:
             [runtime_session_id],
         )
         return tuple(RuntimeTradeRecord.model_validate_json(row[0]) for row in rows)
+
+    def finalize_completed_trade(
+        self,
+        position: RuntimePositionRecord,
+        trade: RuntimeTradeRecord,
+        updated_session: RuntimeSessionRecord,
+        occurred_at: datetime,
+    ) -> None:
+        """Atomically finalize one actual or shadow trade and its durable state."""
+        _expect(position, RuntimePositionRecord, "position")
+        _expect(trade, RuntimeTradeRecord, "trade")
+        _expect(updated_session, RuntimeSessionRecord, "updated_session")
+        if position.is_shadow is not trade.trade.is_shadow:
+            raise ValueError("position and completed trade shadow status must match")
+        if position.exit_lifecycle is not RuntimeExitLifecycle.FILLED:
+            raise ValueError("completed position must have FILLED exit lifecycle")
+        if position.runtime_session_id != trade.runtime_session_id:
+            raise ValueError("position and trade runtime sessions must match")
+        if position.runtime_session_id != updated_session.runtime_session_id:
+            raise ValueError("position and updated session runtime sessions must match")
+        if position.candidate_fingerprint != trade.candidate_fingerprint:
+            raise ValueError("position and trade candidate fingerprints must match")
+        if candidate_fingerprint(position.candidate) != position.candidate_fingerprint:
+            raise ValueError("position candidate does not match candidate fingerprint")
+        if trade.allocation_decision != position.allocation_decision:
+            raise ValueError("position and trade allocation decisions must match")
+        if trade.trade.entry_fill != position.entry_fill:
+            raise ValueError("position and trade entry fills must match")
+        if trade.trade.ml_score != position.candidate.ml_score:
+            raise ValueError("position and trade ML scores must match")
+        if trade.trade.target_notional != position.candidate.target_notional:
+            raise ValueError("position and trade target notionals must match")
+        expected_signal = position.candidate.order_intent.signal.model_copy(
+            update={"status": trade.trade.signal.status}
+        )
+        if trade.trade.signal != expected_signal:
+            raise ValueError("position candidate and completed trade signal must match")
+        if position.is_shadow:
+            if position.reservation is not None:
+                raise ValueError("completed shadow position cannot hold a reservation")
+            if (
+                position.allocation_decision.outcome
+                is not AllocationOutcome.CAPACITY_REJECTED
+                or position.allocation_decision.reservation is not None
+            ):
+                raise ValueError(
+                    "completed shadow trade requires a CAPACITY_REJECTED allocation"
+                )
+        else:
+            if position.reservation is None:
+                raise ValueError("actual completed position requires its reservation")
+            if position.allocation_decision.reservation != position.reservation:
+                raise ValueError("position reservation must match allocation decision")
+
+        with self._transaction():
+            self._validate_completed_trade_state_in_transaction(
+                position, trade, updated_session
+            )
+            self._close_position_in_transaction(position)
+            self._insert_trade_in_transaction(trade)
+            self._close_allocation_in_transaction(position)
+            if not position.is_shadow:
+                self._delete_reservation_in_transaction(position)
+                self._update_session_capital_in_transaction(updated_session)
+            self._append_completion_events_in_transaction(
+                position, trade, updated_session, occurred_at
+            )
+
+    def _validate_completed_trade_state_in_transaction(
+        self,
+        position: RuntimePositionRecord,
+        trade: RuntimeTradeRecord,
+        updated_session: RuntimeSessionRecord,
+    ) -> None:
+        existing_trade = self._connection.execute(
+            """SELECT 1 FROM runtime_trades
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        ).fetchone()
+        if existing_trade is not None:
+            raise ValueError("candidate already has a completed trade")
+
+        position_row = self._connection.execute(
+            """SELECT active, record_json FROM runtime_positions
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        ).fetchone()
+        if position_row is None or not position_row[0]:
+            raise ValueError("expected active position is missing")
+        persisted_position = RuntimePositionRecord.model_validate_json(position_row[1])
+        if (
+            persisted_position.runtime_session_id != position.runtime_session_id
+            or persisted_position.candidate_fingerprint
+            != position.candidate_fingerprint
+            or persisted_position.candidate != position.candidate
+            or persisted_position.allocation_decision != position.allocation_decision
+            or persisted_position.reservation != position.reservation
+            or persisted_position.entry_fill != position.entry_fill
+        ):
+            raise ValueError("persisted active position is inconsistent with completion")
+
+        allocation_row = self._connection.execute(
+            """SELECT status, plan_json, decision_json FROM runtime_allocations
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        ).fetchone()
+        if allocation_row is None or allocation_row[0] != "OPEN":
+            raise ValueError("completed trade requires an OPEN allocation")
+        persisted_plan = RuntimeTradePlan.model_validate_json(allocation_row[1])
+        persisted_decision = AllocationDecision.model_validate_json(allocation_row[2])
+        if (
+            persisted_plan.candidate != position.candidate
+            or persisted_decision != position.allocation_decision
+            or trade.allocation_decision != persisted_decision
+        ):
+            raise ValueError("persisted allocation is inconsistent with completion")
+
+        reservation_row = self._connection.execute(
+            """SELECT record_json FROM active_reservations
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        ).fetchone()
+        if position.is_shadow:
+            if reservation_row is not None:
+                raise ValueError("completed shadow trade cannot have a reservation")
+        else:
+            if reservation_row is None:
+                raise ValueError("completed actual trade requires an active reservation")
+            persisted_reservation = CapitalReservation.model_validate_json(
+                reservation_row[0]
+            )
+            if persisted_reservation != position.reservation:
+                raise ValueError("persisted reservation is inconsistent with completion")
+
+        session_row = self._connection.execute(
+            """SELECT record_json FROM runtime_sessions
+               WHERE runtime_session_id = ?""",
+            [position.runtime_session_id],
+        ).fetchone()
+        if session_row is None:
+            raise ValueError("completed trade runtime session is missing")
+        persisted_session = RuntimeSessionRecord.model_validate_json(session_row[0])
+        if position.is_shadow:
+            if persisted_session != updated_session:
+                raise ValueError("shadow completion cannot modify the runtime session")
+        else:
+            if persisted_session.model_copy(
+                update={"current_capital": updated_session.current_capital}
+            ) != updated_session:
+                raise ValueError("updated session is inconsistent with persisted session")
+            if (
+                persisted_session.current_capital + trade.trade.net_pnl
+                != updated_session.current_capital
+            ):
+                raise ValueError(
+                    "updated session capital must apply trade net P&L exactly once"
+                )
+
+    def _close_position_in_transaction(self, position: RuntimePositionRecord) -> None:
+        self._connection.execute(
+            """UPDATE runtime_positions SET active = FALSE, record_json = ?
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [
+                _json(position),
+                position.runtime_session_id,
+                position.candidate_fingerprint,
+            ],
+        )
+
+    def _insert_trade_in_transaction(self, trade: RuntimeTradeRecord) -> None:
+        self._connection.execute(
+            "INSERT INTO runtime_trades VALUES (?, ?, ?)",
+            [trade.runtime_session_id, trade.candidate_fingerprint, _json(trade)],
+        )
+
+    def _close_allocation_in_transaction(self, position: RuntimePositionRecord) -> None:
+        self._connection.execute(
+            """UPDATE runtime_allocations SET status = 'CLOSED'
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        )
+
+    def _delete_reservation_in_transaction(
+        self, position: RuntimePositionRecord
+    ) -> None:
+        self._connection.execute(
+            """DELETE FROM active_reservations
+               WHERE runtime_session_id = ? AND candidate_fingerprint = ?""",
+            [position.runtime_session_id, position.candidate_fingerprint],
+        )
+
+    def _update_session_capital_in_transaction(
+        self, updated_session: RuntimeSessionRecord
+    ) -> None:
+        self._write_session(updated_session, insert=False)
+
+    def _append_completion_events_in_transaction(
+        self,
+        position: RuntimePositionRecord,
+        trade: RuntimeTradeRecord,
+        updated_session: RuntimeSessionRecord,
+        occurred_at: datetime,
+    ) -> None:
+        self._append_event_unlocked(
+            position.runtime_session_id,
+            occurred_at,
+            "TRADE_CLOSED",
+            f"candidate={position.candidate_fingerprint};shadow={position.is_shadow}",
+        )
+        if position.is_shadow:
+            return
+        self._append_event_unlocked(
+            position.runtime_session_id,
+            occurred_at,
+            "CAPITAL_UPDATED",
+            f"current_capital={updated_session.current_capital}",
+        )
 
     def close(self) -> None:
         with self._lock:

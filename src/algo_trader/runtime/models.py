@@ -34,7 +34,7 @@ from algo_trader.portfolio import (
     MarginRequirementQuote,
 )
 
-RUNTIME_ARCHITECTURE_VERSION = "2"
+RUNTIME_ARCHITECTURE_VERSION = "3"
 MARKET_TIMEZONE_NAME = "Asia/Kolkata"
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
@@ -165,7 +165,7 @@ class RuntimeSessionRecord(FrozenRuntimeModel):
     runtime_session_id: NonEmptyStr
     trading_date: date
     mode: RuntimeMode
-    runtime_version: Literal["2"] = RUNTIME_ARCHITECTURE_VERSION
+    runtime_version: Literal["3"] = RUNTIME_ARCHITECTURE_VERSION
     phase: RuntimePhase = RuntimePhase.CREATED
     starting_capital: PositiveDecimal
     current_capital: FiniteDecimal

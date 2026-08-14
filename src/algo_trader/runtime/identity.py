@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from algo_trader.portfolio import AllocationCandidate, CandidateIdentity
-from algo_trader.runtime.models import RuntimeConfig, RuntimeOrderLeg
+from algo_trader.runtime.models import (
+    RUNTIME_ARCHITECTURE_VERSION,
+    RuntimeConfig,
+    RuntimeOrderLeg,
+)
 
 
 def candidate_identity_payload(identity: CandidateIdentity) -> list[object]:
@@ -47,7 +51,7 @@ def runtime_client_order_id(
         "leg": leg.value,
         "attempt": attempt,
         "runtime_session_id": runtime_session_id.strip(),
-        "runtime_version": "2",
+        "runtime_version": RUNTIME_ARCHITECTURE_VERSION,
     }
     return f"NAT-RUNTIME-{hashlib.sha256(_canonical_json(payload)).hexdigest()}"
 

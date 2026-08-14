@@ -210,12 +210,13 @@ def service(
     broker=None,
     simulator=None,
     runtime_session_id: str = "session-1",
+    state_store_type=RuntimeStateStore,
 ):
     selected_config = config(
         tmp_path, mode=mode, capital=capital, live_enabled=live_enabled
     )
     clock = FakeClock(current or at(9, 16))
-    store = RuntimeStateStore(selected_config.state_db_path)
+    store = state_store_type(selected_config.state_db_path)
     runtime = RuntimeService(
         runtime_session_id=runtime_session_id,
         trading_date=TRADING_DATE,
@@ -229,6 +230,44 @@ def service(
         simulator=simulator,
     )
     return runtime, store, clock
+
+
+class FailingFinalizationStore(RuntimeStateStore):
+    """Inject a deterministic failure after one finalization mutation."""
+
+    failure_stage = ""
+
+    def _fail_after(self, stage: str) -> None:
+        if self.failure_stage == stage:
+            raise OSError(f"injected finalization failure after {stage}")
+
+    def _close_position_in_transaction(self, position) -> None:
+        super()._close_position_in_transaction(position)
+        self._fail_after("position")
+
+    def _insert_trade_in_transaction(self, trade) -> None:
+        super()._insert_trade_in_transaction(trade)
+        self._fail_after("trade")
+
+    def _close_allocation_in_transaction(self, position) -> None:
+        super()._close_allocation_in_transaction(position)
+        self._fail_after("allocation")
+
+    def _delete_reservation_in_transaction(self, position) -> None:
+        super()._delete_reservation_in_transaction(position)
+        self._fail_after("reservation")
+
+    def _update_session_capital_in_transaction(self, updated_session) -> None:
+        super()._update_session_capital_in_transaction(updated_session)
+        self._fail_after("capital")
+
+    def _append_completion_events_in_transaction(
+        self, position, trade, updated_session, occurred_at
+    ) -> None:
+        super()._append_completion_events_in_transaction(
+            position, trade, updated_session, occurred_at
+        )
+        self._fail_after("events")
 
 
 def test_credentials_use_exact_file_and_never_mutate_environment(tmp_path: Path) -> None:
@@ -314,7 +353,7 @@ def test_clock_calendar_session_times_and_config_contract(tmp_path: Path) -> Non
     with pytest.raises(ValidationError, match="strictly increasing"):
         RuntimeSessionTimes(entry_cutoff_time=times.market_open_time)
     selected = config(tmp_path, mode=RuntimeMode.LIVE)
-    assert RUNTIME_ARCHITECTURE_VERSION == "2"
+    assert RUNTIME_ARCHITECTURE_VERSION == "3"
     assert selected.live_order_submission_enabled is False
     assert "secret" not in repr(selected).lower()
     with pytest.raises(ValidationError):
@@ -508,6 +547,160 @@ def test_paper_service_allocates_fills_protects_costs_and_updates_capital(
     store.close()
 
 
+def test_completed_actual_trade_is_atomically_durable_across_restart(
+    tmp_path: Path,
+) -> None:
+    runtime, store, clock = service(tmp_path)
+    runtime.start()
+    selected = plan()
+    runtime.process_plans((selected,), decision_at=at(9, 16))
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    completed = runtime.on_market_tick(tick("111", timestamp=at(9, 17)))
+    expected_capital = Decimal("100000") + completed[0].trade.net_pnl
+    fingerprint = candidate_fingerprint(selected.candidate)
+
+    assert store.load_positions("session-1") == ()
+    assert store.load_trades("session-1") == completed
+    assert store.load_allocations("session-1")[0][3] == "CLOSED"
+    assert store.load_reservations("session-1") == ()
+    assert store.get_session("session-1").current_capital == expected_capital
+    event_types = [event.event_type for event in store.list_events("session-1")]
+    assert event_types.count("TRADE_CLOSED") == 1
+    assert event_types.count("CAPITAL_UPDATED") == 1
+    store.close()
+
+    reopened = RuntimeStateStore(config(tmp_path).state_db_path)
+    assert reopened.load_positions("session-1") == ()
+    assert len(reopened.load_trades("session-1")) == 1
+    assert reopened.load_allocations("session-1")[0][3] == "CLOSED"
+    assert reopened.load_reservations("session-1") == ()
+    assert reopened.get_session("session-1").current_capital == expected_capital
+    recovered = RuntimeService(
+        runtime_session_id="session-1",
+        trading_date=TRADING_DATE,
+        config=config(tmp_path),
+        clock=clock,
+        trading_calendar=ExplicitTradingDayCalendar([TRADING_DATE]),
+        state_store=reopened,
+        margin_provider=FixedMarginProvider(),
+    )
+    assert recovered.start() is RuntimePhase.TRADING
+    assert recovered.positions == ()
+    assert recovered.portfolio_state.active_reservations == ()
+    assert recovered.economic_capital == expected_capital
+    assert candidate_fingerprint(selected.candidate) == fingerprint
+    reopened.close()
+
+
+def test_paper_exit_evidence_does_not_close_position_before_service_commit(
+    tmp_path: Path,
+) -> None:
+    runtime, store, _ = service(tmp_path)
+    runtime.start()
+    runtime.process_plans((plan(),), decision_at=at(9, 16))
+    gateway = runtime._paper_gateway
+    opened = gateway.on_market_tick(tick("100", timestamp=at(9, 16)))
+    assert len(opened.opened) == 1
+
+    detected = gateway.on_market_tick(tick("111", timestamp=at(9, 17)))
+    assert len(detected.closed) == 1
+    assert detected.closed[0][0].exit_lifecycle is RuntimeExitLifecycle.FILLED
+    assert len(gateway.positions) == 1
+    assert len(store.load_positions("session-1")) == 1
+    assert store.load_trades("session-1") == ()
+    assert store.load_allocations("session-1")[0][3] == "OPEN"
+    assert len(store.load_reservations("session-1")) == 1
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["position", "trade", "allocation", "reservation", "capital", "events"],
+)
+def test_completed_trade_finalization_rolls_back_every_durable_effect(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    class SelectedFailingStore(FailingFinalizationStore):
+        pass
+
+    SelectedFailingStore.failure_stage = failure_stage
+    runtime, store, _ = service(tmp_path, state_store_type=SelectedFailingStore)
+    runtime.start()
+    selected = plan()
+    runtime.process_plans((selected,), decision_at=at(9, 16))
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    before_capital = runtime.economic_capital
+
+    with pytest.raises(OSError, match=f"after {failure_stage}"):
+        runtime.on_market_tick(tick("111", timestamp=at(9, 17)))
+
+    assert runtime.phase is RuntimePhase.HALTED
+    assert runtime.economic_capital == before_capital
+    assert len(runtime.positions) == 1
+    assert len(runtime.portfolio_state.active_reservations) == 1
+    store.close()
+
+    reopened = RuntimeStateStore(config(tmp_path).state_db_path)
+    assert len(reopened.load_positions("session-1")) == 1
+    assert reopened.load_trades("session-1") == ()
+    assert reopened.load_allocations("session-1")[0][3] == "OPEN"
+    assert len(reopened.load_reservations("session-1")) == 1
+    assert reopened.get_session("session-1").current_capital == before_capital
+    event_types = [event.event_type for event in reopened.list_events("session-1")]
+    assert "TRADE_CLOSED" not in event_types
+    assert "CAPITAL_UPDATED" not in event_types
+    assert event_types[-1] == "SESSION_HALTED"
+    assert [event.sequence for event in reopened.list_events("session-1")] == list(
+        range(1, len(event_types) + 1)
+    )
+    reopened.close()
+
+
+def test_failed_finalization_keeps_runtime_memory_precommit_and_rejects_duplicate(
+    tmp_path: Path,
+) -> None:
+    class TradeFailingStore(FailingFinalizationStore):
+        failure_stage = "trade"
+
+    runtime, store, _ = service(tmp_path, state_store_type=TradeFailingStore)
+    runtime.start()
+    selected = plan()
+    runtime.process_plans((selected,), decision_at=at(9, 16))
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    open_position = runtime.positions[0]
+    before_state = runtime.portfolio_state
+    before_capital = runtime.economic_capital
+
+    with pytest.raises(OSError, match="after trade"):
+        runtime.on_market_tick(tick("111", timestamp=at(9, 17)))
+
+    assert runtime.phase is RuntimePhase.HALTED
+    assert runtime.economic_capital == before_capital
+    assert runtime.portfolio_state == before_state
+    assert runtime.positions == (open_position,)
+    assert store.load_trades("session-1") == ()
+    store.close()
+
+    successful, successful_store, _ = service(tmp_path / "duplicate")
+    successful.start()
+    successful.process_plans((selected,), decision_at=at(9, 16))
+    successful.on_market_tick(tick("100", timestamp=at(9, 16)))
+    persisted_position = successful.positions[0]
+    completed = successful.on_market_tick(tick("111", timestamp=at(9, 17)))[0]
+    with pytest.raises(ValueError, match="already has a completed trade"):
+        successful_store.finalize_completed_trade(
+            persisted_position.model_copy(
+                update={"exit_lifecycle": RuntimeExitLifecycle.FILLED}
+            ),
+            completed,
+            successful_store.get_session("session-1"),
+            at(9, 17),
+        )
+    assert len(successful_store.load_trades("session-1")) == 1
+    successful_store.close()
+
+
 def test_paper_limit_strategy_exit_and_pending_square_off_release(tmp_path: Path) -> None:
     runtime, store, _ = service(tmp_path)
     runtime.start()
@@ -556,6 +749,121 @@ def test_capacity_shadow_is_separate_and_never_changes_capital(tmp_path: Path) -
     assert runtime.economic_capital == starting
     assert len(runtime.portfolio_state.active_reservations) == 1
     store.close()
+
+
+def test_shadow_completion_is_atomic_and_capital_neutral_across_restart(
+    tmp_path: Path,
+) -> None:
+    runtime, store, clock = service(
+        tmp_path,
+        capital=Decimal("50000"),
+        margin=Decimal("60000"),
+    )
+    runtime.start()
+    selected = plan()
+    decision = runtime.process_plans((selected,), decision_at=at(9, 16)).decisions[0]
+    assert decision.outcome is AllocationOutcome.CAPACITY_REJECTED
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    shadow_position = runtime.positions[0]
+    completed = runtime.on_market_tick(tick("111", timestamp=at(9, 17)))
+
+    assert completed[0].trade.is_shadow
+    assert runtime.economic_capital == Decimal("50000")
+    assert runtime.portfolio_state.active_reservations == ()
+    assert store.load_positions("session-1") == ()
+    assert store.load_trades("session-1") == completed
+    assert store.load_allocations("session-1")[0][3] == "CLOSED"
+    assert store.load_reservations("session-1") == ()
+    assert store.get_session("session-1").current_capital == Decimal("50000")
+    event_types = [event.event_type for event in store.list_events("session-1")]
+    assert event_types.count("TRADE_CLOSED") == 1
+    assert "CAPITAL_UPDATED" not in event_types
+
+    with pytest.raises(ValueError, match="already has a completed trade"):
+        store.finalize_completed_trade(
+            shadow_position.model_copy(
+                update={"exit_lifecycle": RuntimeExitLifecycle.FILLED}
+            ),
+            completed[0],
+            store.get_session("session-1"),
+            at(9, 17),
+        )
+    assert len(store.load_trades("session-1")) == 1
+    assert [event.event_type for event in store.list_events("session-1")].count(
+        "TRADE_CLOSED"
+    ) == 1
+    store.close()
+
+    reopened = RuntimeStateStore(config(tmp_path, capital=Decimal("50000")).state_db_path)
+    assert reopened.load_positions("session-1") == ()
+    assert len(reopened.load_trades("session-1")) == 1
+    assert reopened.load_allocations("session-1")[0][3] == "CLOSED"
+    assert reopened.load_reservations("session-1") == ()
+    assert reopened.get_session("session-1").current_capital == Decimal("50000")
+    recovered = RuntimeService(
+        runtime_session_id="session-1",
+        trading_date=TRADING_DATE,
+        config=config(tmp_path, capital=Decimal("50000")),
+        clock=clock,
+        trading_calendar=ExplicitTradingDayCalendar([TRADING_DATE]),
+        state_store=reopened,
+        margin_provider=FixedMarginProvider(Decimal("60000")),
+    )
+    assert recovered.start() is RuntimePhase.TRADING
+    assert recovered.positions == ()
+    assert recovered.economic_capital == Decimal("50000")
+    assert recovered.portfolio_state.active_reservations == ()
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["position", "trade", "allocation", "events"],
+)
+def test_shadow_finalization_failure_rolls_back_storage_and_memory(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    class SelectedFailingStore(FailingFinalizationStore):
+        pass
+
+    SelectedFailingStore.failure_stage = failure_stage
+    runtime, store, _ = service(
+        tmp_path,
+        capital=Decimal("50000"),
+        margin=Decimal("60000"),
+        state_store_type=SelectedFailingStore,
+    )
+    runtime.start()
+    selected = plan()
+    decision = runtime.process_plans((selected,), decision_at=at(9, 16)).decisions[0]
+    assert decision.outcome is AllocationOutcome.CAPACITY_REJECTED
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    shadow_position = runtime.positions[0]
+    before_state = runtime.portfolio_state
+    before_capital = runtime.economic_capital
+
+    with pytest.raises(OSError, match=f"after {failure_stage}"):
+        runtime.on_market_tick(tick("111", timestamp=at(9, 17)))
+
+    assert runtime.phase is RuntimePhase.HALTED
+    assert runtime.positions == (shadow_position,)
+    assert runtime.portfolio_state == before_state
+    assert runtime.economic_capital == before_capital
+    store.close()
+
+    reopened = RuntimeStateStore(config(tmp_path, capital=Decimal("50000")).state_db_path)
+    assert len(reopened.load_positions("session-1")) == 1
+    assert reopened.load_positions("session-1")[0].is_shadow
+    assert reopened.load_trades("session-1") == ()
+    assert reopened.load_allocations("session-1")[0][3] == "OPEN"
+    assert reopened.load_reservations("session-1") == ()
+    assert reopened.get_session("session-1").current_capital == before_capital
+    event_types = [event.event_type for event in reopened.list_events("session-1")]
+    assert "TRADE_CLOSED" not in event_types
+    assert "CAPITAL_UPDATED" not in event_types
+    assert event_types[-1] == "SESSION_HALTED"
+    reopened.close()
 
 
 def test_short_excursions_and_forced_time_exit_have_correct_signs(tmp_path: Path) -> None:
@@ -953,6 +1261,106 @@ def test_live_protective_exit_is_opposite_once_and_completion_updates_capital(
     assert runtime.positions == ()
     assert store.load_trades("session-1") == completed
     store.close()
+
+
+def test_live_finalization_failure_retains_broker_evidence_and_restarts_halted(
+    tmp_path: Path,
+) -> None:
+    class TradeFailingStore(FailingFinalizationStore):
+        failure_stage = "trade"
+
+    broker = FakeBroker()
+    runtime, store, _ = service(
+        tmp_path,
+        mode=RuntimeMode.LIVE,
+        live_enabled=True,
+        broker=broker,
+        state_store_type=TradeFailingStore,
+    )
+    broker.state_store = store
+    runtime.start()
+    runtime.process_plans((plan(),), decision_at=at(9, 16))
+    broker.order_snapshots["ORDER-1"] = order_snapshot(
+        state=BrokerOrderState.FILLED, filled=10, remaining=0
+    )
+    broker.fills = (broker_fill("ENTRY-FILL", 10, "100"),)
+    broker.positions = (
+        BrokerPosition(
+            instrument=master().resolve("AAA"),
+            product_type="INTRADAY",
+            net_quantity=10,
+            buy_quantity=10,
+            sell_quantity=0,
+            buy_average_price=Decimal("100"),
+            sell_average_price=Decimal("0"),
+            net_average_price=Decimal("100"),
+        ),
+    )
+    runtime.reconcile(at(9, 17))
+    starting_capital = runtime.economic_capital
+    runtime.on_market_tick(tick("111", timestamp=at(9, 18)))
+    exit_order = next(
+        order
+        for order in store.list_orders("session-1")
+        if order.leg is RuntimeOrderLeg.EXIT
+    )
+    broker.order_snapshots[exit_order.broker_order_id] = order_snapshot(
+        broker_order_id=exit_order.broker_order_id,
+        unique_order_id=exit_order.unique_order_id,
+        tag=exit_order.broker_order_tag,
+        action=BrokerTransactionAction.SELL,
+        state=BrokerOrderState.FILLED,
+        filled=10,
+        remaining=0,
+    )
+    exit_fill = broker_fill(
+        "EXIT-FILL",
+        10,
+        "111",
+        order_id=exit_order.broker_order_id,
+        action=BrokerTransactionAction.SELL,
+        timestamp=at(9, 19),
+    )
+    broker.fills += (exit_fill,)
+    broker.positions = ()
+
+    with pytest.raises(OSError, match="after trade"):
+        runtime.reconcile(at(9, 19))
+
+    assert runtime.phase is RuntimePhase.HALTED
+    assert runtime.economic_capital == starting_capital
+    assert len(runtime.positions) == 1
+    assert runtime.positions[0].exit_lifecycle is RuntimeExitLifecycle.FILLED
+    assert store.load_trades("session-1") == ()
+    assert store.load_allocations("session-1")[0][3] == "OPEN"
+    assert len(store.load_reservations("session-1")) == 1
+    assert store.list_broker_fills(exit_order.client_order_id) == (exit_fill,)
+    place_count = len([call for call in broker.calls if call[0] == "place_order"])
+    store.close()
+
+    reopened = TradeFailingStore(
+        config(tmp_path, mode=RuntimeMode.LIVE, live_enabled=True).state_db_path
+    )
+    recovered = RuntimeService(
+        runtime_session_id="session-1",
+        trading_date=TRADING_DATE,
+        config=config(tmp_path, mode=RuntimeMode.LIVE, live_enabled=True),
+        clock=FakeClock(at(9, 20)),
+        trading_calendar=ExplicitTradingDayCalendar([TRADING_DATE]),
+        state_store=reopened,
+        margin_provider=FixedMarginProvider(),
+        broker=broker,
+        instrument_master=master(),
+    )
+    broker.state_store = reopened
+    assert recovered.start() is RuntimePhase.HALTED
+    assert reopened.load_trades("session-1") == ()
+    assert len(reopened.load_positions("session-1")) == 1
+    assert len(reopened.load_reservations("session-1")) == 1
+    assert reopened.get_session("session-1").current_capital == starting_capital
+    assert reopened.list_broker_fills(exit_order.client_order_id) == (exit_fill,)
+    assert len([call for call in broker.calls if call[0] == "place_order"]) == place_count
+    reopened.close()
 
 
 def _filled_live_runtime(tmp_path: Path):
