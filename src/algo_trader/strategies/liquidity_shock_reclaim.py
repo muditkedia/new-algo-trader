@@ -1,14 +1,16 @@
 """Liquidity-shock exhaustion reclaim signal generation.
 
-The hypothesis is that an exceptional same-time-of-day price shock with unusual
-volume can exhaust after sweeping a known structural level. LONG and SHORT rules
-are exact mirrors: shock, sweep, same-bar reclaim, then one-bar confirmation.
-The confirmation candle must complete before a Signal exists, so its availability
-time is the decision timestamp. Historical normalization excludes the current
-session, while session levels and swings obey explicit knowledge-time cutoffs.
-The strategy creates no orders, allocations, ML decisions, or execution plans.
-Initial-stop evidence and the approved R-multiple exit/trailing policy are stored
-for downstream composition after an actual entry fill is known.
+Version 1.1 narrows the original exhaustion-reclaim hypothesis to the most
+structurally important liquidity pools: previous-day high/low only. A qualifying
+shock must also carry exceptional same-time-of-day volume (RVOL >= 12x). LONG and
+SHORT rules remain exact mirrors: shock, prior-day-level sweep, same-bar reclaim,
+then one-bar confirmation. The confirmation candle must complete before a Signal
+exists, so its availability time is the decision timestamp. Historical
+normalization excludes the current session. The strategy creates no orders,
+allocations, ML decisions, or execution plans. Initial-stop evidence and the
+R-multiple trailing mechanics are preserved from v1.0, while the hard target is
+reduced modestly from 1.5R to 1.25R. Exit metadata is stored for downstream
+composition after an actual entry fill is known.
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ from algo_trader.indicators import atr
 from algo_trader.strategies.validation import validate_strategy_input
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
+_RELATIVE_VOLUME_THRESHOLD = 12.0
+_LEVEL_POLICY = "PRIOR_DAY_EXTREME_ONLY"
 
 _PARAMETERS: Mapping[str, Any] = MappingProxyType(
     {
@@ -41,19 +45,17 @@ _PARAMETERS: Mapping[str, Any] = MappingProxyType(
         "shock_robust_z_threshold": 3.0,
         "mad_consistency_scale": 1.4826,
         "volume_history_sessions": 20,
-        "relative_volume_threshold": 2.0,
+        "relative_volume_threshold": _RELATIVE_VOLUME_THRESHOLD,
         "liquidity_history_sessions": 20,
         "minimum_median_daily_turnover_rupees": 200_000_000,
         "atr_period": 14,
-        "swing_left_bars": 2,
-        "swing_right_bars": 2,
-        "minimum_level_age_minutes": 10,
+        "level_policy": _LEVEL_POLICY,
         "minimum_penetration_atr": 0.10,
         "maximum_penetration_atr": 0.75,
         "minimum_reclaim_atr": 0.05,
         "confirmation_bars": 1,
         "stop_buffer_atr": 0.10,
-        "reward_r_multiple": 1.5,
+        "reward_r_multiple": 1.25,
         "maximum_hold_minutes": 30,
         "latest_exit_time": "15:10",
         "trailing_breakeven_trigger_r": 0.75,
@@ -61,7 +63,7 @@ _PARAMETERS: Mapping[str, Any] = MappingProxyType(
         "trailing_profit_lock_trigger_r": 1.0,
         "trailing_profit_lock_stop_r": 0.25,
         "trailing_distance_r": 0.50,
-        "trailing_hard_target_r": 1.5,
+        "trailing_hard_target_r": 1.25,
         "max_signals_per_symbol_per_day": 1,
     }
 )
@@ -109,10 +111,10 @@ class _Normalization:
 
 
 class LiquidityShockReclaimStrategy:
-    """Causal symmetric liquidity-shock sweep/reclaim strategy, Variant B."""
+    """Causal symmetric prior-day liquidity-shock exhaustion-reclaim strategy."""
 
     strategy_id = "liquidity-shock-exhaustion-reclaim"
-    strategy_version = "1.0.0"
+    strategy_version = "1.1.0"
     parameters = _PARAMETERS
     warmup_bars = 4500
 
@@ -338,7 +340,7 @@ def _normalization(
     )
     if not all(math.isfinite(value) for value in values):
         return None
-    if relative_volume < 2.0 or median_turnover < 200_000_000:
+    if relative_volume < _RELATIVE_VOLUME_THRESHOLD or median_turnover < 200_000_000:
         return None
     return _Normalization(*values)
 
@@ -378,9 +380,7 @@ def _qualifying_level(
     indices_by_date: dict[date, list[int]],
 ) -> tuple[_Level, float, float] | None:
     event = bars[event_index]
-    levels = _candidate_levels(
-        bars, event_index, side, prior_dates, indices_by_date
-    )
+    levels = _candidate_levels(bars, side, prior_dates, indices_by_date)
     for level in levels:
         penetration = (
             level.price - event.low
@@ -403,118 +403,34 @@ def _qualifying_level(
 
 def _candidate_levels(
     bars: tuple[_Bar, ...],
-    event_index: int,
     side: Side,
     prior_dates: list[date],
     indices_by_date: dict[date, list[int]],
 ) -> tuple[_Level, ...]:
-    event = bars[event_index]
-    levels: list[_Level] = []
-    if prior_dates:
-        prior_indices = indices_by_date[prior_dates[-1]]
-        if prior_indices:
-            price = (
-                min(bars[index].low for index in prior_indices)
-                if side is Side.LONG
-                else max(bars[index].high for index in prior_indices)
-            )
-            level_type = "PDL" if side is Side.LONG else "PDH"
-            levels.append(
-                _Level(
-                    price,
-                    level_type,
-                    bar_available_at(bars[prior_indices[-1]].timestamp, 5),
-                )
-            )
+    """Return the single previous-day extreme eligible in v1.1.
 
-    cutoff = event.timestamp - timedelta(minutes=10)
-    session_indices = indices_by_date[event.trading_date]
-    aged = [
-        index
-        for index in session_indices
-        if index < event_index and bar_available_at(bars[index].timestamp, 5) <= cutoff
-    ]
-    if aged:
-        extreme = (
-            min(bars[index].low for index in aged)
-            if side is Side.LONG
-            else max(bars[index].high for index in aged)
-        )
-        source_index = next(
-            index
-            for index in aged
-            if (bars[index].low if side is Side.LONG else bars[index].high) == extreme
-        )
-        levels.append(
-            _Level(
-                extreme,
-                "SESSION_LOW" if side is Side.LONG else "SESSION_HIGH",
-                bar_available_at(bars[source_index].timestamp, 5),
-            )
-        )
+    Session-so-far and confirmed swing levels were valid v1.0 research features
+    but are intentionally excluded from v1.1. The previous-day extreme is known
+    before the current session opens, preserving the original causal contract.
+    """
+    if not prior_dates:
+        return ()
 
-    swing = _most_recent_confirmed_swing(
-        bars, event_index, side, session_indices, cutoff
+    prior_indices = indices_by_date[prior_dates[-1]]
+    if not prior_indices:
+        return ()
+
+    price = (
+        min(bars[index].low for index in prior_indices)
+        if side is Side.LONG
+        else max(bars[index].high for index in prior_indices)
     )
-    if swing is not None:
-        levels.append(swing)
-    return tuple(levels)
-
-
-def _most_recent_confirmed_swing(
-    bars: tuple[_Bar, ...],
-    event_index: int,
-    side: Side,
-    session_indices: list[int],
-    cutoff: datetime,
-) -> _Level | None:
-    eligible: list[_Level] = []
-    for position in range(2, len(session_indices) - 2):
-        window_indices = session_indices[position - 2 : position + 3]
-        if not _is_consecutive_five_bar_window(bars, window_indices):
-            continue
-        pivot_index = session_indices[position]
-        right_two_index = session_indices[position + 2]
-        if right_two_index >= event_index:
-            break
-        known_at = bar_available_at(bars[right_two_index].timestamp, 5)
-        if known_at > cutoff:
-            continue
-        pivot = bars[pivot_index].low if side is Side.LONG else bars[pivot_index].high
-        neighbors = [
-            bars[session_indices[neighbor]].low
-            if side is Side.LONG
-            else bars[session_indices[neighbor]].high
-            for neighbor in (position - 2, position - 1, position + 1, position + 2)
-        ]
-        is_swing = (
-            all(pivot < value for value in neighbors)
-            if side is Side.LONG
-            else all(pivot > value for value in neighbors)
-        )
-        if is_swing:
-            # A pivot becomes usable only when its second right-hand bar completes.
-            eligible.append(
-                _Level(
-                    pivot,
-                    "SWING_LOW" if side is Side.LONG else "SWING_HIGH",
-                    known_at,
-                )
-            )
-    return eligible[-1] if eligible else None
-
-
-def _is_consecutive_five_bar_window(
-    bars: tuple[_Bar, ...], window_indices: list[int]
-) -> bool:
-    window = tuple(bars[index] for index in window_indices)
     return (
-        len(window) == 5
-        and len({bar.trading_date for bar in window}) == 1
-        and all(
-            window[index + 1].timestamp - window[index].timestamp == _BAR_DELTA
-            for index in range(4)
-        )
+        _Level(
+            price=price,
+            level_type="PDL" if side is Side.LONG else "PDH",
+            known_at=bar_available_at(bars[prior_indices[-1]].timestamp, 5),
+        ),
     )
 
 
@@ -572,14 +488,14 @@ def _feature_snapshot(
         "confirmation_return_from_event_close": confirmation.close / event.close - 1.0,
         "stop_reference_price": stop_reference,
         "stop_buffer_atr": 0.10,
-        "reward_r_multiple": 1.5,
+        "reward_r_multiple": 1.25,
         "maximum_hold_minutes": 30,
         "trailing_breakeven_trigger_r": 0.75,
         "trailing_breakeven_stop_r": 0.0,
         "trailing_profit_lock_trigger_r": 1.0,
         "trailing_profit_lock_stop_r": 0.25,
         "trailing_distance_r": 0.50,
-        "trailing_hard_target_r": 1.5,
+        "trailing_hard_target_r": 1.25,
     }
     numeric = [value for value in values.values() if isinstance(value, int | float)]
     if not all(math.isfinite(value) for value in numeric):

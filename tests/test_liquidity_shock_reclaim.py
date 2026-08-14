@@ -28,19 +28,17 @@ EXPECTED_PARAMETERS = {
     "shock_robust_z_threshold": 3.0,
     "mad_consistency_scale": 1.4826,
     "volume_history_sessions": 20,
-    "relative_volume_threshold": 2.0,
+    "relative_volume_threshold": 12.0,
     "liquidity_history_sessions": 20,
     "minimum_median_daily_turnover_rupees": 200_000_000,
     "atr_period": 14,
-    "swing_left_bars": 2,
-    "swing_right_bars": 2,
-    "minimum_level_age_minutes": 10,
+    "level_policy": "PRIOR_DAY_EXTREME_ONLY",
     "minimum_penetration_atr": 0.10,
     "maximum_penetration_atr": 0.75,
     "minimum_reclaim_atr": 0.05,
     "confirmation_bars": 1,
     "stop_buffer_atr": 0.10,
-    "reward_r_multiple": 1.5,
+    "reward_r_multiple": 1.25,
     "maximum_hold_minutes": 30,
     "latest_exit_time": "15:10",
     "trailing_breakeven_trigger_r": 0.75,
@@ -48,7 +46,7 @@ EXPECTED_PARAMETERS = {
     "trailing_profit_lock_trigger_r": 1.0,
     "trailing_profit_lock_stop_r": 0.25,
     "trailing_distance_r": 0.50,
-    "trailing_hard_target_r": 1.5,
+    "trailing_hard_target_r": 1.25,
     "max_signals_per_symbol_per_day": 1,
 }
 
@@ -87,7 +85,7 @@ def make_fixture(
     zero_mad: bool = False,
     history_return_step: float = 0.0002,
     valid_volume_sessions: int = 60,
-    event_volume_multiple: float = 2.5,
+    event_volume_multiple: float = 15.0,
     history_volume: float = 30_000.0,
     confirmation_gap_minutes: int = 5,
     confirmation_low: float | None = None,
@@ -257,7 +255,7 @@ def test_identity_protocol_and_exact_immutable_parameters() -> None:
 
     assert isinstance(strategy, Strategy)
     assert strategy.strategy_id == "liquidity-shock-exhaustion-reclaim"
-    assert strategy.strategy_version == "1.0.0"
+    assert strategy.strategy_version == "1.1.0"
     assert strategy.warmup_bars == 4500
     assert strategy.parameters == EXPECTED_PARAMETERS
     assert isinstance(strategy.parameters, MappingProxyType)
@@ -297,52 +295,26 @@ def test_robust_z_below_threshold_and_zero_mad_reject() -> None:
 
 def test_volume_history_rvol_and_liquidity_filters() -> None:
     assert _signals(make_fixture(valid_volume_sessions=19)) == []
-    assert _signals(make_fixture(event_volume_multiple=1.99)) == []
+    assert _signals(make_fixture(event_volume_multiple=11.99)) == []
+    assert len(_signals(make_fixture(event_volume_multiple=12.0))) == 1
     assert _signals(
-        make_fixture(history_volume=10_000.0, event_volume_multiple=2.5)
+        make_fixture(history_volume=10_000.0, event_volume_multiple=15.0)
     ) == []
 
 
 @pytest.mark.parametrize(
-    ("side", "mode", "expected_type"),
+    ("side", "mode"),
     [
-        (Side.LONG, "SESSION", "SESSION_LOW"),
-        (Side.SHORT, "SESSION", "SESSION_HIGH"),
-        (Side.LONG, "SWING", "SWING_LOW"),
-        (Side.SHORT, "SWING", "SWING_HIGH"),
+        (Side.LONG, "SESSION"),
+        (Side.SHORT, "SESSION"),
+        (Side.LONG, "SWING"),
+        (Side.SHORT, "SWING"),
+        (Side.LONG, "SWING_SINGLE"),
+        (Side.SHORT, "SWING_SINGLE"),
     ],
 )
-def test_aged_session_and_most_recent_confirmed_swing_levels(
-    side: Side, mode: str, expected_type: str
-) -> None:
-    signals = _signals(make_fixture(side=side, level_mode=mode))
-
-    assert len(signals) == 1
-    assert signals[0].feature_snapshot["level_type"] == expected_type
-    if mode == "SWING":
-        assert signals[0].feature_snapshot["level_price"] == (
-            96.0 if side is Side.LONG else 104.0
-        )
-
-
-@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
-def test_swing_window_requires_consecutive_five_minute_bars(side: Side) -> None:
-    complete = make_fixture(side=side, level_mode="SWING_SINGLE")
-    complete_signals = _signals(complete)
-
-    assert len(complete_signals) == 1
-    assert complete_signals[0].feature_snapshot["level_type"] == (
-        "SWING_LOW" if side is Side.LONG else "SWING_HIGH"
-    )
-
-    current_start = 60 * 74
-    gapped = (
-        complete.with_row_index("row_number")
-        .filter(pl.col("row_number") != current_start + 41)
-        .drop("row_number")
-    )
-
-    assert _signals(gapped) == []
+def test_v11_rejects_non_prior_day_structural_levels(side: Side, mode: str) -> None:
+    assert _signals(make_fixture(side=side, level_mode=mode)) == []
 
 
 def test_date_ordinal_lookup_preserves_exact_representative_signal(
@@ -374,7 +346,7 @@ def test_new_session_level_and_equal_swing_plateau_are_unavailable() -> None:
     assert _signals(make_fixture(level_mode="SWING_PLATEAU")) == []
 
 
-def test_level_priority_is_previous_day_then_session_then_swing() -> None:
+def test_prior_day_level_remains_selected_when_other_structures_overlap() -> None:
     signal = _signals(make_fixture(level_mode="PRIORITY"))[0]
     assert signal.feature_snapshot["level_type"] == "PDL"
 
@@ -511,14 +483,18 @@ def test_signal_timestamp_timezone_and_feature_exit_metadata() -> None:
         "trailing_profit_lock_trigger_r": 1.0,
         "trailing_profit_lock_stop_r": 0.25,
         "trailing_distance_r": 0.50,
-        "trailing_hard_target_r": 1.5,
+        "trailing_hard_target_r": 1.25,
     }
     assert "target_price" not in feature
     assert "trailing_stop_price" not in feature
     assert "target_price" not in signal.strategy_parameters
 
 
-def test_only_first_signal_per_day_input_immutability_and_future_invariance() -> None:
+def test_only_first_signal_per_day_input_immutability_and_future_invariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This test isolates daily signal gating/future invariance from ATR-path changes.
+    _constant_atr(monkeypatch, 2.0)
     first = make_fixture()
     rows = first.rows(named=True)
     current_start = 60 * 74
@@ -548,7 +524,8 @@ def test_only_first_signal_per_day_input_immutability_and_future_invariance() ->
                 high=100.0,
                 low=95.5,
                 close=96.5,
-                volume=75_000.0,
+                # v1.1 requires RVOL >= 12x; make this synthetic setup 15x.
+                volume=30_000.0 * 15.0,
             ),
             _row(
                 _timestamp(current_day, 63),
