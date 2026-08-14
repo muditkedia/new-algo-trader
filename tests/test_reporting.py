@@ -36,12 +36,16 @@ from algo_trader.portfolio import (
     MarginRequirementQuote,
 )
 from algo_trader.reporting import (
+    COMPARISON_VISUAL_FILENAMES,
     REPORT_TABLE_FILENAMES,
     REPORTING_VERSION,
     ReportContext,
     ReportingIntegrityError,
     build_report,
+    build_report_comparison,
     report_tables,
+    write_comparison_excel_report,
+    write_comparison_visual_report,
     write_excel_report,
     write_report_dataset,
     write_visual_report,
@@ -275,8 +279,8 @@ def test_actual_metrics_reconcile_and_exclude_shadow_economics() -> None:
     metrics = report.performance
 
     assert metrics.net_profit == Decimal("300")
-    assert REPORTING_VERSION == "2"
-    assert report.provenance.reporting_version == "2"
+    assert REPORTING_VERSION == "3"
+    assert report.provenance.reporting_version == "3"
     assert metrics.ending_capital == Decimal("100300")
     assert metrics.actual_trade_count == 3
     assert (
@@ -545,6 +549,16 @@ def test_excel_uses_bundle_values_and_has_native_charts(tmp_path: Path) -> None:
         "Costs",
         "Exit Reasons",
         "Provenance",
+        "Cumulative PnL",
+        "Monthly Performance",
+        "Side Performance",
+        "Time of Day",
+        "Holding Distribution",
+        "Rolling 20 Trades",
+        "Trade Diagnostics",
+        "Cost Impact",
+        "Outcome Funnel",
+        "Actual vs Shadow",
     }
     assert workbook.sheetnames[0] == "Dashboard"
     assert required <= set(workbook.sheetnames)
@@ -552,7 +566,7 @@ def test_excel_uses_bundle_values_and_has_native_charts(tmp_path: Path) -> None:
     assert workbook["Actual Trades"].max_row == 4
     assert workbook["Shadow Trades"].max_row == 2
     assert workbook["Daily Performance"].max_row == 6
-    assert len(workbook["Dashboard"]._charts) >= 5
+    assert len(workbook["Dashboard"]._charts) >= 8
     assert len(workbook["Exit Reasons"]._charts) == 1
     assert len(workbook["Symbol Breakdown"]._charts) == 1
 
@@ -570,6 +584,23 @@ def test_matplotlib_visuals_are_headless_nonempty_and_close_figures(tmp_path: Pa
         "cost_composition.png",
         "request_outcomes.png",
         "exit_reason_counts.png",
+        "cumulative_gross_vs_net_pnl.png",
+        "cumulative_cost_drag.png",
+        "monthly_net_pnl.png",
+        "monthly_trade_count.png",
+        "monthly_win_rate.png",
+        "monthly_profit_factor.png",
+        "long_short_performance.png",
+        "time_of_day_performance.png",
+        "holding_time_distribution.png",
+        "mfe_mae_scatter.png",
+        "mfe_vs_realized_return.png",
+        "mae_vs_realized_return.png",
+        "rolling_win_rate.png",
+        "rolling_profit_factor.png",
+        "rolling_average_net_return.png",
+        "symbol_performance_top_bottom.png",
+        "actual_vs_shadow_comparison.png",
     }
     assert all(path.stat().st_size > 0 for path in paths)
     assert tuple(plt.get_fignums()) == before
@@ -593,5 +624,216 @@ def test_zero_trade_excel_and_visuals_do_not_fabricate_observations(tmp_path: Pa
     )
     assert write_excel_report(report, tmp_path / "zero.xlsx").exists()
     paths = write_visual_report(report, tmp_path / "zero-visuals")
-    assert len(paths) == 8
+    assert len(paths) == 25
     assert all(path.stat().st_size > 0 for path in paths)
+
+
+def test_visual_diagnostic_tables_are_deterministic_and_reconcile_exactly() -> None:
+    report = build_report(make_result(), context())
+    tables = report_tables(report)
+
+    cumulative = tables["cumulative_pnl"].to_dicts()
+    assert cumulative[-1]["cumulative_net_pnl"] == Decimal("300")
+    assert cumulative[-1]["cumulative_cost_drag"] == report.actual_costs.total_costs
+    assert (
+        cumulative[-1]["cumulative_gross_pnl"]
+        - cumulative[-1]["cumulative_cost_drag"]
+        == cumulative[-1]["cumulative_net_pnl"]
+    )
+    monthly = tables["monthly_performance"].to_dicts()
+    assert monthly == [
+        {
+            "month": "2025-01",
+            "trade_count": 3,
+            "net_pnl": Decimal("300"),
+            "win_rate": Decimal("1") / Decimal("3"),
+            "average_net_return": Decimal("0.002"),
+            "total_costs": Decimal("52.5"),
+            "profit_factor": Decimal("2.5"),
+            "profit_factor_is_unbounded": False,
+            "profit_factor_is_undefined": False,
+        }
+    ]
+    assert tables["side_performance"].select(
+        "side", "trade_count", "net_pnl"
+    ).to_dicts() == [
+        {"side": "LONG", "trade_count": 2, "net_pnl": Decimal("500")},
+        {"side": "SHORT", "trade_count": 1, "net_pnl": Decimal("-200")},
+    ]
+    assert tables["time_of_day_performance"]["entry_time_bucket_ist"].to_list() == [
+        "09:00"
+    ]
+    holding = tables["holding_time_distribution"].filter(
+        pl.col("bucket") == ">30-60"
+    )
+    assert holding["trade_count"][0] == 3
+    diagnostics = tables["trade_diagnostics"]
+    assert diagnostics["holding_minutes"].to_list() == [Decimal("50")] * 3
+    assert diagnostics["mfe_return"].to_list() == [Decimal("0.02")] * 3
+    assert diagnostics["mae_return"].to_list() == [Decimal("-0.01")] * 3
+    assert tables["rolling_trade_metrics"].is_empty()
+    assert tables["actual_shadow_comparison"]["economic_status"][1].startswith(
+        "HYPOTHETICAL"
+    )
+
+
+def test_rolling_metrics_begin_only_at_twenty_completed_actual_trades() -> None:
+    records = tuple(
+        make_record(
+            f"s-{index}",
+            Decimal("100") if index % 2 == 0 else Decimal("-50"),
+            at(2, 10) + timedelta(minutes=index),
+        )
+        for index in range(20)
+    )
+    report = build_report(make_result(actual=records, shadow=()), context())
+    rolling = report_tables(report)["rolling_trade_metrics"]
+
+    assert rolling.height == 1
+    assert rolling["trade_number"][0] == 20
+    assert rolling["rolling_win_rate"][0] == Decimal("0.5")
+    assert rolling["profit_factor"][0] == Decimal("2")
+
+
+def _comparison_report(
+    report_id: str,
+    run_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    research_scope_id: str | None = None,
+    plan_id: str | None = None,
+    window_id: str | None = None,
+):
+    report = build_report(make_result(), context())
+    return report.model_copy(
+        update={
+            "provenance": report.provenance.model_copy(
+                update={
+                    "report_id": report_id,
+                    "run_id": run_id,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "research_scope_id": research_scope_id,
+                    "plan_id": plan_id,
+                    "window_id": window_id,
+                }
+            )
+        }
+    )
+
+
+def test_development_comparison_is_chronological_and_has_no_pooled_cagr() -> None:
+    first = _comparison_report("report-1", "run-1", at(1, 9), at(2, 15))
+    second = _comparison_report("report-2", "run-2", at(3, 9), at(4, 15))
+
+    comparison = build_report_comparison((second, first))
+
+    assert not comparison.is_oos
+    assert [row.report_id for row in comparison.rows] == ["report-1", "report-2"]
+    assert not hasattr(comparison, "cagr")
+    assert all(row.cagr == first.performance.cagr for row in comparison.rows)
+
+
+def test_oos_comparison_validates_scope_plan_and_unique_windows() -> None:
+    first = _comparison_report(
+        "report-1",
+        "run-1",
+        at(1, 9),
+        at(2, 15),
+        research_scope_id="scope",
+        plan_id="plan",
+        window_id="window-1",
+    )
+    second = _comparison_report(
+        "report-2",
+        "run-2",
+        at(3, 9),
+        at(4, 15),
+        research_scope_id="scope",
+        plan_id="plan",
+        window_id="window-2",
+    )
+    comparison = build_report_comparison((second, first))
+    assert comparison.is_oos
+    assert comparison.research_scope_id == "scope"
+    assert [row.window_id for row in comparison.rows] == ["window-1", "window-2"]
+
+    with pytest.raises(ValueError, match="research_scope_id"):
+        build_report_comparison(
+            (
+                first,
+                second.model_copy(
+                    update={
+                        "provenance": second.provenance.model_copy(
+                            update={"research_scope_id": "other"}
+                        )
+                    }
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="plan_id"):
+        build_report_comparison(
+            (
+                first,
+                second.model_copy(
+                    update={
+                        "provenance": second.provenance.model_copy(
+                            update={"plan_id": "other"}
+                        )
+                    }
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="unique"):
+        build_report_comparison(
+            (
+                first,
+                second.model_copy(
+                    update={
+                        "provenance": second.provenance.model_copy(
+                            update={"window_id": "window-1"}
+                        )
+                    }
+                ),
+            )
+        )
+
+
+def test_comparison_outputs_are_auditable_headless_and_non_overwriting(
+    tmp_path: Path,
+) -> None:
+    report = _comparison_report("report-1", "run-1", at(1, 9), at(2, 15))
+    comparison = build_report_comparison((report,))
+    excel = write_comparison_excel_report(comparison, tmp_path / "comparison.xlsx")
+    workbook = load_workbook(excel)
+
+    assert workbook.sheetnames == ["Comparison Dashboard", "Raw Comparison"]
+    assert len(workbook["Comparison Dashboard"]._charts) == 8
+    assert workbook["Raw Comparison"].max_row == 2
+    with pytest.raises(FileExistsError):
+        write_comparison_excel_report(comparison, excel)
+
+    before = tuple(plt.get_fignums())
+    paths = write_comparison_visual_report(comparison, tmp_path / "comparison-visuals")
+    assert {path.name for path in paths} == set(COMPARISON_VISUAL_FILENAMES)
+    assert all(path.stat().st_size > 0 for path in paths)
+    assert tuple(plt.get_fignums()) == before
+    with pytest.raises(FileExistsError):
+        write_comparison_visual_report(comparison, tmp_path / "comparison-visuals")
+
+
+def test_empty_and_partial_oos_comparisons_fail_cleanly() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        build_report_comparison(())
+
+    development = _comparison_report("report-1", "run-1", at(1, 9), at(2, 15))
+    partial = development.model_copy(
+        update={
+            "provenance": development.provenance.model_copy(
+                update={"research_scope_id": "scope"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="partial OOS"):
+        build_report_comparison((partial,))

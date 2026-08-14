@@ -32,7 +32,7 @@ from algo_trader.reporting.models import (
     SymbolTradeMetrics,
 )
 
-REPORTING_VERSION = "2"
+REPORTING_VERSION = "3"
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 ZERO = Decimal("0")
 

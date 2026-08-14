@@ -300,3 +300,50 @@ class ReportBundle(FrozenReportingModel):
     acceptance: AcceptanceAssessment
     actual_trade_records: tuple[BacktestTradeRecord, ...]
     shadow_trade_records: tuple[BacktestTradeRecord, ...]
+
+
+class ReportComparisonRow(FrozenReportingModel):
+    """One source-backed run/window row in a deterministic comparison."""
+
+    report_id: NonEmptyStr
+    run_id: NonEmptyStr
+    backtester_version: NonEmptyStr
+    reporting_version: NonEmptyStr
+    research_scope_id: str | None = None
+    plan_id: str | None = None
+    window_id: str | None = None
+    window_start: datetime
+    window_end: datetime
+    actual_trade_count: int = Field(ge=0)
+    actual_trades_per_day: NonNegativeDecimal
+    net_pnl: FiniteDecimal
+    ending_capital: FiniteDecimal
+    cagr: FiniteDecimal | None
+    win_rate: NonNegativeDecimal | None
+    profit_factor: ProfitFactor
+    average_net_return: FiniteDecimal | None
+    max_drawdown: NonNegativeDecimal
+    total_actual_costs: NonNegativeDecimal
+    long_trade_count: int = Field(ge=0)
+    short_trade_count: int = Field(ge=0)
+    cagr_pass: bool
+    win_rate_pass: bool
+    profit_factor_pass: bool
+    average_net_return_pass: bool
+    frequency_target_met: bool
+    hard_quantitative_targets_pass: bool
+
+
+class ReportComparisonBundle(FrozenReportingModel):
+    """Chronological report comparison without pooled pseudo-backtest metrics."""
+
+    is_oos: bool
+    research_scope_id: str | None = None
+    plan_id: str | None = None
+    rows: tuple[ReportComparisonRow, ...]
+
+    @model_validator(mode="after")
+    def validate_nonempty(self) -> ReportComparisonBundle:
+        if not self.rows:
+            raise ValueError("report comparison must contain at least one row")
+        return self

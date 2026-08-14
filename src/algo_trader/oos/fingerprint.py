@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
 
@@ -31,7 +31,7 @@ def _canonicalize(value: object) -> object:
             return "0"
         normalized = value.normalize()
         return format(normalized, "f")
-    if isinstance(value, datetime | date):
+    if isinstance(value, datetime | date | time):
         return value.isoformat()
     if isinstance(value, Enum):
         return value.value

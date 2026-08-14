@@ -19,17 +19,22 @@ from algo_trader import (
     SignalStatus,
 )
 from algo_trader.backtest import (
+    BACKTESTER_VERSION,
     BacktestConfig,
+    BacktestExitPolicyResolver,
     BacktestIntegrityError,
     BacktestRequestOutcome,
     BacktestRequestResult,
     BacktestTradeRecord,
     BacktestTradeRequest,
+    DynamicExitPolicySpec,
     HistoricalBacktester,
+    RMultipleTrailingExitPolicyResolver,
 )
 from algo_trader.costs import BrokeragePlan
 from algo_trader.data import MarketDataConfig, ParquetMarketDataStore
 from algo_trader.execution import FixedBasisPointsSlippage, HistoricalExecutionSimulator
+from algo_trader.oos import fingerprint_backtest_result
 from algo_trader.portfolio import (
     AllocationCandidate,
     MarginRequirementQuote,
@@ -189,6 +194,57 @@ def run_backtest(
     return HistoricalBacktester(store, provider, simulator).run(config, requests)
 
 
+def trailing_policy(
+    initial_stop_price: Decimal = Decimal("95"),
+    **updates: object,
+) -> DynamicExitPolicySpec:
+    parameters: dict[str, object] = {
+        "initial_stop_price": initial_stop_price,
+        "hard_target_r": Decimal("1.5"),
+        "breakeven_trigger_r": Decimal("0.75"),
+        "breakeven_stop_r": Decimal("0"),
+        "profit_lock_trigger_r": Decimal("1"),
+        "profit_lock_stop_r": Decimal("0.25"),
+        "trailing_distance_r": Decimal("0.5"),
+        "maximum_hold_minutes": 30,
+        "latest_exit_time": time(15, 10),
+    }
+    parameters.update(updates)
+    return DynamicExitPolicySpec(
+        policy_id="R_MULTIPLE_TRAILING_V1", parameters=parameters
+    )
+
+
+class RecordingTrailingSimulator(HistoricalExecutionSimulator):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.active_levels: list[ProtectiveExitSpec] = []
+
+    def fill_active_protective_exit(self, **kwargs):
+        self.active_levels.append(kwargs["protective_exit"])
+        return super().fill_active_protective_exit(**kwargs)
+
+
+class StubExitPolicyResolver:
+    policy_id = "STUB_POLICY"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def resolve(self, spec, **kwargs):
+        self.calls.append({"spec": spec, **kwargs})
+        result = kwargs["execution_simulator"].fill_market_exit(
+            side=kwargs["side"],
+            symbol=kwargs["symbol"],
+            quantity=kwargs["quantity"],
+            requested_at=kwargs["forced_cutoff"],
+            exit_reason=ExitReason.TIME_EXIT,
+            candles=kwargs["candles"],
+        )
+        assert result is not None
+        return result
+
+
 @pytest.mark.parametrize(
     ("side", "exit_price", "profitable"),
     [
@@ -232,6 +288,581 @@ def test_completed_long_and_short_profit_and_loss(
     assert result.ending_capital == Decimal("100000") + record.trade.net_pnl
     assert record.trade.signal.status is SignalStatus.EXECUTED
     assert request.candidate.order_intent.signal.status is SignalStatus.GENERATED
+
+
+def test_dynamic_exit_spec_is_frozen_detached_serializable_and_extra_forbid() -> None:
+    parameters: dict[str, object] = {
+        "name": "value",
+        "enabled": True,
+        "count": 2,
+        "ratio": 0.5,
+        "amount": Decimal("1.25"),
+        "when": at(2025, 1, 2, 10, 0),
+        "clock": time(15, 10),
+        "optional": None,
+    }
+    spec = DynamicExitPolicySpec(policy_id="POLICY", parameters=parameters)
+    parameters["count"] = 99
+
+    assert spec.parameters["count"] == 2
+    assert spec.model_dump()["parameters"] == {
+        "name": "value",
+        "enabled": True,
+        "count": 2,
+        "ratio": 0.5,
+        "amount": Decimal("1.25"),
+        "when": at(2025, 1, 2, 10, 0),
+        "clock": time(15, 10),
+        "optional": None,
+    }
+    reordered = DynamicExitPolicySpec(
+        policy_id="POLICY",
+        parameters=dict(
+            reversed(tuple(spec.model_dump()["parameters"].items()))
+        ),
+    )
+    assert reordered.model_dump_json() == spec.model_dump_json()
+    with pytest.raises(TypeError):
+        spec.parameters["count"] = 3  # type: ignore[index]
+    with pytest.raises(ValidationError, match="extra"):
+        DynamicExitPolicySpec(policy_id="POLICY", parameters={}, unknown=True)
+    with pytest.raises((TypeError, ValidationError), match="serializable scalar"):
+        DynamicExitPolicySpec(policy_id="POLICY", parameters={"bad": object()})
+    with pytest.raises((TypeError, ValidationError), match="serializable scalar"):
+        DynamicExitPolicySpec(policy_id="POLICY", parameters={"bad": lambda: None})
+
+
+def test_trade_request_dynamic_policy_exclusivity_and_legacy_compatibility() -> None:
+    candidate = make_candidate(at(2025, 1, 2, 9, 20))
+    assert BacktestTradeRequest(candidate=candidate).dynamic_exit_policy is None
+    assert BacktestTradeRequest(
+        candidate=candidate,
+        dynamic_exit_policy=trailing_policy(),
+        strategy_exit_at=at(2025, 1, 2, 9, 40),
+    )
+    with pytest.raises(ValidationError, match="cannot both"):
+        BacktestTradeRequest(
+            candidate=candidate,
+            protective_exit=ProtectiveExitSpec(stop_price=Decimal("95")),
+            dynamic_exit_policy=trailing_policy(),
+        )
+
+
+def test_resolver_registry_rejects_duplicates_and_unknown_before_allocation(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0),
+                (at(*day, 15, 25), 100.0, 101.0, 99.0, 100.0),
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        HistoricalBacktester(
+            store,
+            StubMarginProvider({"strategy": Decimal("1")}),
+            exit_policy_resolvers=(StubExitPolicyResolver(), StubExitPolicyResolver()),
+        )
+
+    provider = StubMarginProvider({"strategy": Decimal("1")})
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=DynamicExitPolicySpec(
+            policy_id="UNKNOWN", parameters={}
+        ),
+    )
+    with pytest.raises(ValueError, match="unknown dynamic exit"):
+        HistoricalBacktester(store, provider).run(
+            make_config(at(*day, 9, 15), at(*day, 15, 30)), [request]
+        )
+    assert provider.calls == []
+
+
+def test_resolver_dispatch_receives_actual_fill_loaded_candles_and_validates_result(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    rows = [
+        (at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0),
+        (at(*day, 15, 25), 102.0, 103.0, 101.0, 102.0),
+    ]
+    store = make_store(tmp_path, {"TEST": rows})
+    resolver = StubExitPolicyResolver()
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=DynamicExitPolicySpec(
+            policy_id=resolver.policy_id, parameters={}
+        ),
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(resolver,),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    assert isinstance(resolver, BacktestExitPolicyResolver)
+    assert len(resolver.calls) == 1
+    assert resolver.calls[0]["entry_fill"].price == Decimal("100.0")
+    assert resolver.calls[0]["candles"].height == 2
+    assert result.actual_trade_records[0].trade.exit_fill.price == Decimal("102.0")
+
+    class BadResolver(StubExitPolicyResolver):
+        policy_id = "BAD"
+
+        def resolve(self, spec, **kwargs):
+            return None
+
+    bad_request = request.model_copy(
+        update={
+            "dynamic_exit_policy": DynamicExitPolicySpec(
+                policy_id="BAD", parameters={}
+            )
+        }
+    )
+    with pytest.raises(TypeError, match="ExitResult"):
+        HistoricalBacktester(
+            store,
+            StubMarginProvider({"strategy": Decimal("1")}),
+            exit_policy_resolvers=(BadResolver(),),
+        ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [bad_request])
+
+
+def test_registered_resolvers_do_not_change_legacy_backtest_economics(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0),
+                (at(*day, 15, 25), 110.0, 111.0, 109.0, 110.0),
+            ]
+        },
+    )
+    config = make_config(at(*day, 9, 15), at(*day, 15, 30))
+    request = make_request(at(*day, 9, 20))
+    first = HistoricalBacktester(
+        store, StubMarginProvider({"strategy": Decimal("1")})
+    ).run(config, [request])
+    second = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(config, [request])
+
+    assert BACKTESTER_VERSION == "2"
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    ("side", "stop", "high", "low", "expected_price"),
+    [
+        (Side.LONG, Decimal("95"), 108.0, 99.0, Decimal("107.5")),
+        (Side.SHORT, Decimal("105"), 101.0, 92.0, Decimal("92.5")),
+    ],
+)
+def test_r_multiple_target_uses_actual_fill_and_is_long_short_symmetric(
+    tmp_path: Path,
+    side: Side,
+    stop: Decimal,
+    high: float,
+    low: float,
+    expected_price: Decimal,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, high, low, 100.0),
+                (at(*day, 9, 50), 100.0, 101.0, 99.0, 100.0),
+            ]
+        },
+    )
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20), side=side),
+        dynamic_exit_policy=trailing_policy(stop),
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    trade = result.actual_trade_records[0].trade
+    assert trade.exit_reason is ExitReason.TARGET_REACHED
+    assert trade.exit_fill.price == expected_price
+    assert trade.exit_fill.timestamp == at(*day, 9, 25)
+
+
+@pytest.mark.parametrize(
+    ("side", "stop"),
+    [(Side.LONG, Decimal("100")), (Side.SHORT, Decimal("100"))],
+)
+def test_r_multiple_nonpositive_actual_fill_r_is_integrity_failure(
+    tmp_path: Path, side: Side, stop: Decimal
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0),
+                (at(*day, 9, 50), 100.0, 101.0, 99.0, 100.0),
+            ]
+        },
+    )
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20), side=side),
+        dynamic_exit_policy=trailing_policy(stop),
+    )
+    with pytest.raises(BacktestIntegrityError, match="strictly positive initial risk"):
+        HistoricalBacktester(
+            store,
+            StubMarginProvider({"strategy": Decimal("1")}),
+            exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+        ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+
+def test_r_multiple_trailing_is_next_bar_causal_and_monotonic(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                # Earns breakeven but trades below it in the same bar: no retroactive exit.
+                (at(*day, 9, 20), 100.0, 103.75, 99.0, 102.0),
+                # Earns exact +1R while the previously active breakeven survives.
+                (at(*day, 9, 25), 102.0, 105.0, 100.5, 104.0),
+                # Profit-lock stop is active only now and is touched intrabar.
+                (at(*day, 9, 30), 104.0, 104.5, 101.0, 102.0),
+                (at(*day, 9, 50), 102.0, 103.0, 101.0, 102.0),
+            ]
+        },
+    )
+    simulator = RecordingTrailingSimulator()
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=trailing_policy(),
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        simulator,
+        (RMultipleTrailingExitPolicyResolver(),),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    trade = result.actual_trade_records[0].trade
+    assert [spec.stop_price for spec in simulator.active_levels] == [
+        Decimal("95"),
+        Decimal("100"),
+        Decimal("101.25"),
+    ]
+    assert {spec.target_price for spec in simulator.active_levels} == {
+        Decimal("107.5")
+    }
+    assert trade.exit_reason is ExitReason.STOP_LOSS
+    assert trade.exit_fill.price == Decimal("101.25")
+    assert trade.exit_fill.timestamp == at(*day, 9, 35)
+
+
+def test_r_multiple_above_profit_trigger_uses_distance_behind_best(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 106.0, 99.0, 105.0),
+                (at(*day, 9, 25), 104.0, 104.5, 103.0, 103.5),
+                (at(*day, 9, 50), 103.0, 104.0, 102.0, 103.0),
+            ]
+        },
+    )
+    simulator = RecordingTrailingSimulator()
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=trailing_policy(),
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        simulator,
+        (RMultipleTrailingExitPolicyResolver(),),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    assert simulator.active_levels[1].stop_price == Decimal("103.5")
+    assert result.actual_trade_records[0].trade.exit_fill.price == Decimal("103.5")
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "policy_updates", "strategy_exit", "deadline", "reason"),
+    [
+        ({}, {}, None, at(2025, 1, 2, 9, 50), ExitReason.TIME_EXIT),
+        ({}, {"maximum_hold_minutes": 400}, None, at(2025, 1, 2, 15, 10), ExitReason.TIME_EXIT),
+        (
+            {"forced_exit_time": time(9, 40)},
+            {"maximum_hold_minutes": 400},
+            None,
+            at(2025, 1, 2, 9, 40),
+            ExitReason.TIME_EXIT,
+        ),
+        (
+            {},
+            {"maximum_hold_minutes": 400},
+            at(2025, 1, 2, 9, 35),
+            at(2025, 1, 2, 9, 35),
+            ExitReason.STRATEGY_EXIT,
+        ),
+    ],
+)
+def test_r_multiple_effective_deadline_caps_and_exact_open_exit(
+    tmp_path: Path,
+    config_updates: dict[str, object],
+    policy_updates: dict[str, object],
+    strategy_exit: datetime | None,
+    deadline: datetime,
+    reason: ExitReason,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0),
+                # Extreme deadline OHLC must be ignored; exit is at this open.
+                (deadline, 102.0, 200.0, 1.0, 150.0),
+            ]
+        },
+    )
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=trailing_policy(**policy_updates),
+        strategy_exit_at=strategy_exit,
+    )
+    config = make_config(
+        at(*day, 9, 15), at(*day, 15, 30), **config_updates
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(config, [request])
+
+    trade = result.actual_trade_records[0].trade
+    assert trade.exit_fill.timestamp == deadline
+    assert trade.exit_fill.price == Decimal("102.0")
+    assert trade.exit_reason is reason
+
+
+def test_r_multiple_max_hold_starts_at_actual_intrabar_limit_fill(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 101.0, 102.0, 99.0, 101.0),
+                (at(*day, 9, 25), 100.0, 101.0, 99.0, 100.0),
+                (at(*day, 9, 55), 103.0, 200.0, 1.0, 103.0),
+            ]
+        },
+    )
+    request = BacktestTradeRequest(
+        candidate=make_candidate(
+            at(*day, 9, 20),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("100"),
+        ),
+        dynamic_exit_policy=trailing_policy(),
+    )
+    trade = HistoricalBacktester(
+        store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(
+        make_config(at(*day, 9, 15), at(*day, 15, 30)), [request]
+    ).actual_trade_records[0].trade
+
+    assert trade.entry_fill.timestamp == at(*day, 9, 25)
+    assert trade.exit_fill.timestamp == at(*day, 9, 55)
+
+
+def test_r_multiple_missing_deadline_fails_but_earlier_protective_exit_does_not(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    request = BacktestTradeRequest(
+        candidate=make_candidate(at(*day, 9, 20)),
+        dynamic_exit_policy=trailing_policy(),
+    )
+    missing_directory = tmp_path / "missing"
+    missing_directory.mkdir()
+    missing_store = make_store(
+        missing_directory,
+        {"TEST": [(at(*day, 9, 20), 100.0, 101.0, 99.0, 100.0)]},
+    )
+    with pytest.raises(BacktestIntegrityError, match="mandatory deadline"):
+        HistoricalBacktester(
+            missing_store,
+            StubMarginProvider({"strategy": Decimal("1")}),
+            exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+        ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    exit_directory = tmp_path / "early"
+    exit_directory.mkdir()
+    early_store = make_store(
+        exit_directory,
+        {"TEST": [(at(*day, 9, 20), 100.0, 101.0, 94.0, 95.0)]},
+    )
+    trade = HistoricalBacktester(
+        early_store,
+        StubMarginProvider({"strategy": Decimal("1")}),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(
+        make_config(at(*day, 9, 15), at(*day, 15, 30)), [request]
+    ).actual_trade_records[0].trade
+    assert trade.exit_reason is ExitReason.STOP_LOSS
+    assert trade.exit_fill.timestamp == at(*day, 9, 25)
+
+
+def test_strategy_one_metadata_is_wired_by_caller_without_strategy_id_magic(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    signal = Signal(
+        strategy_id="liquidity-shock-exhaustion-reclaim",
+        strategy_version="1.0.0",
+        symbol="TEST",
+        timestamp=at(*day, 9, 15),
+        side=Side.LONG,
+        feature_snapshot={
+            "stop_reference_price": 95.0,
+            "trailing_hard_target_r": 1.5,
+            "trailing_breakeven_trigger_r": 0.75,
+            "trailing_breakeven_stop_r": 0.0,
+            "trailing_profit_lock_trigger_r": 1.0,
+            "trailing_profit_lock_stop_r": 0.25,
+            "trailing_distance_r": 0.5,
+            "maximum_hold_minutes": 30,
+        },
+    )
+    order = OrderIntent(
+        signal=signal,
+        timestamp=at(*day, 9, 20),
+        quantity=100,
+        requested_notional=50_000,
+    )
+    score = MLScore(
+        model_version="model-1",
+        quality_score=0.5,
+        calibrated_probability=0.5,
+        predicted_net_return=0.01,
+        recommended_notional=50_000,
+    )
+    feature = signal.feature_snapshot
+    policy = DynamicExitPolicySpec(
+        policy_id="R_MULTIPLE_TRAILING_V1",
+        parameters={
+            "initial_stop_price": feature["stop_reference_price"],
+            "hard_target_r": feature["trailing_hard_target_r"],
+            "breakeven_trigger_r": feature["trailing_breakeven_trigger_r"],
+            "breakeven_stop_r": feature["trailing_breakeven_stop_r"],
+            "profit_lock_trigger_r": feature["trailing_profit_lock_trigger_r"],
+            "profit_lock_stop_r": feature["trailing_profit_lock_stop_r"],
+            "trailing_distance_r": feature["trailing_distance_r"],
+            "maximum_hold_minutes": feature["maximum_hold_minutes"],
+            "latest_exit_time": time(15, 10),
+        },
+    )
+    request = BacktestTradeRequest(
+        candidate=AllocationCandidate(order_intent=order, ml_score=score),
+        dynamic_exit_policy=policy,
+    )
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 108.0, 99.0, 107.0),
+                (at(*day, 9, 50), 107.0, 108.0, 106.0, 107.0),
+            ]
+        },
+    )
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider(
+            {"liquidity-shock-exhaustion-reclaim": Decimal("1")}
+        ),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+
+    trade = result.actual_trade_records[0].trade
+    assert trade.signal.strategy_id == "liquidity-shock-exhaustion-reclaim"
+    assert trade.exit_reason is ExitReason.TARGET_REACHED
+    assert trade.exit_fill.price == Decimal("107.5")
+    repeated = HistoricalBacktester(
+        store,
+        StubMarginProvider(
+            {"liquidity-shock-exhaustion-reclaim": Decimal("1")}
+        ),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(make_config(at(*day, 9, 15), at(*day, 15, 30)), [request])
+    assert fingerprint_backtest_result(result) == fingerprint_backtest_result(repeated)
+
+
+def test_dynamic_exit_uses_identical_actual_and_shadow_resolution(
+    tmp_path: Path,
+) -> None:
+    day = (2025, 1, 2)
+    store = make_store(
+        tmp_path,
+        {
+            "TEST": [
+                (at(*day, 9, 20), 100.0, 108.0, 99.0, 107.0),
+                (at(*day, 9, 50), 107.0, 108.0, 106.0, 107.0),
+            ]
+        },
+    )
+    requests = [
+        BacktestTradeRequest(
+            candidate=make_candidate(
+                at(*day, 9, 20), strategy_id=strategy_id, quality_score=quality
+            ),
+            dynamic_exit_policy=trailing_policy(),
+        )
+        for strategy_id, quality in (("actual", 0.9), ("shadow", 0.8))
+    ]
+    result = HistoricalBacktester(
+        store,
+        StubMarginProvider(
+            {"actual": Decimal("1"), "shadow": Decimal("1")}
+        ),
+        exit_policy_resolvers=(RMultipleTrailingExitPolicyResolver(),),
+    ).run(
+        make_config(
+            at(*day, 9, 15),
+            at(*day, 15, 30),
+            initial_capital=Decimal("1"),
+        ),
+        requests,
+    )
+
+    actual = result.actual_trade_records[0].trade
+    shadow = result.shadow_trade_records[0].trade
+    assert (actual.exit_fill, actual.exit_reason) == (
+        shadow.exit_fill,
+        shadow.exit_reason,
+    )
+    assert result.ending_capital == Decimal("1") + actual.net_pnl
 
 
 @pytest.mark.parametrize(

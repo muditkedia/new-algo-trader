@@ -5,6 +5,12 @@ from algo_trader.reporting.analytics import (
     ReportingIntegrityError,
     build_report,
 )
+from algo_trader.reporting.comparison import (
+    COMPARISON_VISUAL_FILENAMES,
+    build_report_comparison,
+    write_comparison_excel_report,
+    write_comparison_visual_report,
+)
 from algo_trader.reporting.models import (
     AcceptanceAssessment,
     CostSummary,
@@ -14,6 +20,8 @@ from algo_trader.reporting.models import (
     PerformanceMetrics,
     ProfitFactor,
     ReportBundle,
+    ReportComparisonBundle,
+    ReportComparisonRow,
     ReportContext,
     ReportProvenance,
     RequestOutcomeSummary,
@@ -31,6 +39,7 @@ from algo_trader.reporting.tables import (
 __all__ = [
     "REPORTING_VERSION",
     "REPORT_TABLE_FILENAMES",
+    "COMPARISON_VISUAL_FILENAMES",
     "AcceptanceAssessment",
     "CostSummary",
     "DailyPerformance",
@@ -39,6 +48,8 @@ __all__ = [
     "PerformanceMetrics",
     "ProfitFactor",
     "ReportBundle",
+    "ReportComparisonBundle",
+    "ReportComparisonRow",
     "ReportContext",
     "ReportProvenance",
     "ReportingIntegrityError",
@@ -47,8 +58,11 @@ __all__ = [
     "StrategyTradeMetrics",
     "SymbolTradeMetrics",
     "build_report",
+    "build_report_comparison",
     "report_tables",
     "write_excel_report",
+    "write_comparison_excel_report",
+    "write_comparison_visual_report",
     "write_report_dataset",
     "write_visual_report",
 ]

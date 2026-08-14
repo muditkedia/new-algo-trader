@@ -105,12 +105,62 @@ class HistoricalExecutionSimulator:
         if not isinstance(protective_exit, ProtectiveExitSpec):
             raise TypeError("protective_exit must be a ProtectiveExitSpec")
         _validate_protective_geometry(side, entry_fill.price, protective_exit)
+        return self._fill_active_protective_levels(
+            side=side,
+            symbol=symbol,
+            quantity=quantity,
+            active_from=entry_fill.timestamp,
+            protective_exit=protective_exit,
+            candles=candles,
+        )
+
+    def fill_active_protective_exit(
+        self,
+        *,
+        side: Side,
+        symbol: str,
+        quantity: int,
+        active_from: datetime,
+        protective_exit: ProtectiveExitSpec,
+        candles: pl.DataFrame,
+    ) -> ExitResult | None:
+        """Fill active stop/target levels, including a profitable trailing stop.
+
+        Unlike an initial protective specification, an already-active trailing
+        stop may have crossed the entry price. Trigger ordering, fill timing,
+        and slippage are otherwise identical to ``fill_protective_exit``.
+        """
+        _validate_side(side)
+        _validate_symbol(symbol)
+        _validate_quantity(quantity)
+        _validate_aware_timestamp(active_from, "active_from")
+        if not isinstance(protective_exit, ProtectiveExitSpec):
+            raise TypeError("protective_exit must be a ProtectiveExitSpec")
+        return self._fill_active_protective_levels(
+            side=side,
+            symbol=symbol,
+            quantity=quantity,
+            active_from=active_from,
+            protective_exit=protective_exit,
+            candles=candles,
+        )
+
+    def _fill_active_protective_levels(
+        self,
+        *,
+        side: Side,
+        symbol: str,
+        quantity: int,
+        active_from: datetime,
+        protective_exit: ProtectiveExitSpec,
+        candles: pl.DataFrame,
+    ) -> ExitResult | None:
         _validate_execution_candles(candles, symbol)
         if candles.is_empty():
             return None
 
         eligible = candles.filter(
-            pl.col("timestamp").dt.epoch("us") >= _epoch_microseconds(entry_fill.timestamp)
+            pl.col("timestamp").dt.epoch("us") >= _epoch_microseconds(active_from)
         )
         if eligible.is_empty():
             return None

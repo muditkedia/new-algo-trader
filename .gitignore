@@ -29,3 +29,5 @@ Thumbs.db
 
 # Local broker credentials
 /.secrets/
+# Editable install metadata
+*.egg-info/

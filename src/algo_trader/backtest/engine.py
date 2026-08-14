@@ -11,8 +11,13 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from algo_trader.backtest.exit_policies import (
+    BacktestExitPolicyResolver,
+    freeze_exit_policy_registry,
+)
 from algo_trader.backtest.models import (
     BacktestConfig,
+    BacktestIntegrityError,
     BacktestRequestOutcome,
     BacktestRequestResult,
     BacktestRunResult,
@@ -37,12 +42,8 @@ from algo_trader.portfolio import (
     PortfolioState,
 )
 
-BACKTESTER_VERSION = "1"
+BACKTESTER_VERSION = "2"
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
-
-
-class BacktestIntegrityError(RuntimeError):
-    """Raised when missing data prevents a valid same-day run completion."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class HistoricalBacktester:
         market_data_store: ParquetMarketDataStore,
         margin_provider: MarginRequirementProvider,
         execution_simulator: HistoricalExecutionSimulator | None = None,
+        exit_policy_resolvers: Iterable[BacktestExitPolicyResolver] = (),
     ) -> None:
         if not isinstance(market_data_store, ParquetMarketDataStore):
             raise TypeError("market_data_store must be a ParquetMarketDataStore")
@@ -77,6 +79,9 @@ class HistoricalBacktester:
         self.execution_simulator = (
             execution_simulator or HistoricalExecutionSimulator()
         )
+        self.exit_policy_resolvers = freeze_exit_policy_registry(
+            tuple(exit_policy_resolvers)
+        )
         self.allocator = CapitalAllocator()
 
     def run(
@@ -91,6 +96,7 @@ class HistoricalBacktester:
         if any(not isinstance(request, BacktestTradeRequest) for request in selected):
             raise TypeError("all requests must be BacktestTradeRequest instances")
         self._validate_request_window(selected, config)
+        self._validate_requested_exit_policies(selected)
 
         policy = get_fixed_current_backtest_cost_policy(config.brokerage_plan)
         ordered = tuple(
@@ -359,7 +365,37 @@ class HistoricalBacktester:
         symbol = candidate.order_intent.signal.symbol
         quantity = candidate.order_intent.quantity
         possibilities: list[tuple[datetime, int, ExitResult]] = []
-        exit_candles = candles.filter(pl.col("timestamp") <= cutoff)
+        exit_candles = candles.filter(
+            (pl.col("timestamp") >= entry_fill.timestamp)
+            & (pl.col("timestamp") <= cutoff)
+        )
+
+        if request.dynamic_exit_policy is not None:
+            resolver = self.exit_policy_resolvers[
+                request.dynamic_exit_policy.policy_id
+            ]
+            resolved = resolver.resolve(
+                request.dynamic_exit_policy,
+                side=side,
+                symbol=symbol,
+                quantity=quantity,
+                entry_fill=entry_fill,
+                candles=exit_candles,
+                execution_simulator=self.execution_simulator,
+                strategy_exit_at=request.strategy_exit_at,
+                forced_cutoff=cutoff,
+            )
+            if not isinstance(resolved, ExitResult):
+                raise TypeError("exit policy resolver must return an ExitResult")
+            if resolved.fill.quantity != entry_fill.quantity:
+                raise BacktestIntegrityError(
+                    "exit policy resolver returned a quantity different from the entry fill"
+                )
+            if not (entry_fill.timestamp <= resolved.fill.timestamp <= cutoff):
+                raise BacktestIntegrityError(
+                    "exit policy resolver returned a fill outside the open-position window"
+                )
+            return resolved
 
         if request.protective_exit is not None:
             protective = self.execution_simulator.fill_protective_exit(
@@ -479,6 +515,27 @@ class HistoricalBacktester:
             end = min(day_end, config.window_end.astimezone(MARKET_TIMEZONE))
             cache[key] = self.market_data_store.load_candles(symbol, start, end)
         return cache[key]
+
+    def _validate_requested_exit_policies(
+        self,
+        requests: tuple[BacktestTradeRequest, ...],
+    ) -> None:
+        requested = sorted(
+            {
+                request.dynamic_exit_policy.policy_id
+                for request in requests
+                if request.dynamic_exit_policy is not None
+            }
+        )
+        unknown = [
+            policy_id
+            for policy_id in requested
+            if policy_id not in self.exit_policy_resolvers
+        ]
+        if unknown:
+            raise ValueError(
+                "unknown dynamic exit policy_id(s): " + ", ".join(unknown)
+            )
 
     @staticmethod
     def _validate_request_window(

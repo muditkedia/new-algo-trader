@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
 from algo_trader.backtest import BacktestTradeRecord
+from algo_trader.domain import Side
 from algo_trader.reporting.models import ProfitFactor, ReportBundle
 
 DECIMAL = pl.Decimal(precision=38, scale=28)
+MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
+ZERO = Decimal("0")
 
 REPORT_TABLE_FILENAMES = {
     "summary": "summary.parquet",
@@ -29,6 +35,16 @@ REPORT_TABLE_FILENAMES = {
     "actual_exit_reason_breakdown": "actual_exit_reason_breakdown.parquet",
     "shadow_exit_reason_breakdown": "shadow_exit_reason_breakdown.parquet",
     "provenance": "provenance.parquet",
+    "cumulative_pnl": "cumulative_pnl.parquet",
+    "monthly_performance": "monthly_performance.parquet",
+    "side_performance": "side_performance.parquet",
+    "time_of_day_performance": "time_of_day_performance.parquet",
+    "holding_time_distribution": "holding_time_distribution.parquet",
+    "rolling_trade_metrics": "rolling_trade_metrics.parquet",
+    "trade_diagnostics": "trade_diagnostics.parquet",
+    "cost_impact": "cost_impact.parquet",
+    "outcome_funnel": "outcome_funnel.parquet",
+    "actual_shadow_comparison": "actual_shadow_comparison.parquet",
 }
 
 
@@ -307,6 +323,313 @@ def _exit_table(values: tuple[object, ...]) -> pl.DataFrame:
     )
 
 
+def _factor_from_records(records: tuple[BacktestTradeRecord, ...]) -> ProfitFactor:
+    positive = sum(
+        (record.trade.net_pnl for record in records if record.trade.net_pnl > 0),
+        start=ZERO,
+    )
+    negative = -sum(
+        (record.trade.net_pnl for record in records if record.trade.net_pnl < 0),
+        start=ZERO,
+    )
+    if negative > 0:
+        return ProfitFactor(value=positive / negative)
+    if positive > 0:
+        return ProfitFactor(value=None, is_unbounded=True)
+    return ProfitFactor(value=None, is_undefined=True)
+
+
+def _aggregate_rows(
+    groups: list[tuple[str, tuple[BacktestTradeRecord, ...]]],
+    label_name: str,
+) -> pl.DataFrame:
+    rows = []
+    for label, records in groups:
+        wins = sum(record.trade.net_pnl > 0 for record in records)
+        factor = _factor_from_records(records)
+        rows.append(
+            {
+                label_name: label,
+                "trade_count": len(records),
+                "net_pnl": sum(
+                    (record.trade.net_pnl for record in records), start=ZERO
+                ),
+                "win_rate": Decimal(wins) / len(records) if records else None,
+                "average_net_return": (
+                    sum(
+                        (record.trade.net_return for record in records), start=ZERO
+                    )
+                    / len(records)
+                    if records
+                    else None
+                ),
+                "total_costs": sum(
+                    (record.trade.total_costs for record in records), start=ZERO
+                ),
+                **_profit_factor_columns(factor),
+            }
+        )
+    return _frame(
+        rows,
+        {
+            label_name: pl.String,
+            "trade_count": pl.Int64,
+            "net_pnl": DECIMAL,
+            "win_rate": DECIMAL,
+            "average_net_return": DECIMAL,
+            "total_costs": DECIMAL,
+            "profit_factor": DECIMAL,
+            "profit_factor_is_unbounded": pl.Boolean,
+            "profit_factor_is_undefined": pl.Boolean,
+        },
+    )
+
+
+def _diagnostic_tables(report: ReportBundle) -> dict[str, pl.DataFrame]:
+    records = report.actual_trade_records
+    cumulative_gross = ZERO
+    cumulative_net = ZERO
+    cumulative_cost = ZERO
+    cumulative_rows = []
+    diagnostic_rows = []
+    for trade_number, record in enumerate(records, start=1):
+        trade = record.trade
+        cumulative_gross += trade.gross_pnl
+        cumulative_net += trade.net_pnl
+        cumulative_cost += trade.total_costs
+        cumulative_rows.append(
+            {
+                "trade_number": trade_number,
+                "exit_timestamp": trade.exit_fill.timestamp,
+                "cumulative_gross_pnl": cumulative_gross,
+                "cumulative_net_pnl": cumulative_net,
+                "cumulative_cost_drag": cumulative_cost,
+            }
+        )
+        holding_minutes = Decimal(
+            str((trade.exit_fill.timestamp - trade.entry_fill.timestamp).total_seconds())
+        ) / Decimal("60")
+        diagnostic_rows.append(
+            {
+                "trade_number": trade_number,
+                "symbol": trade.signal.symbol,
+                "side": trade.signal.side.value,
+                "signal_timestamp": trade.signal.timestamp,
+                "entry_timestamp": trade.entry_fill.timestamp,
+                "exit_timestamp": trade.exit_fill.timestamp,
+                "holding_minutes": holding_minutes,
+                "mfe_return": trade.mfe_return,
+                "mae_return": trade.mae_return,
+                "gross_return": trade.gross_return,
+                "net_return": trade.net_return,
+            }
+        )
+
+    grouped_month: dict[str, list[BacktestTradeRecord]] = defaultdict(list)
+    grouped_side: dict[Side, list[BacktestTradeRecord]] = defaultdict(list)
+    grouped_time: dict[str, list[BacktestTradeRecord]] = defaultdict(list)
+    for record in records:
+        trade = record.trade
+        local_exit = trade.exit_fill.timestamp.astimezone(MARKET_TIMEZONE)
+        grouped_month[f"{local_exit.year:04d}-{local_exit.month:02d}"].append(record)
+        grouped_side[trade.signal.side].append(record)
+        local_entry = trade.entry_fill.timestamp.astimezone(MARKET_TIMEZONE)
+        bucket_minute = 30 * (local_entry.minute // 30)
+        grouped_time[f"{local_entry.hour:02d}:{bucket_minute:02d}"].append(record)
+
+    monthly = _aggregate_rows(
+        [(key, tuple(grouped_month[key])) for key in sorted(grouped_month)],
+        "month",
+    )
+    side = _aggregate_rows(
+        [(value.value, tuple(grouped_side[value])) for value in Side],
+        "side",
+    )
+    time_of_day = _aggregate_rows(
+        [(key, tuple(grouped_time[key])) for key in sorted(grouped_time)],
+        "entry_time_bucket_ist",
+    )
+
+    rolling_rows = []
+    for end in range(20, len(records) + 1):
+        window = records[end - 20 : end]
+        wins = sum(record.trade.net_pnl > 0 for record in window)
+        factor = _factor_from_records(window)
+        rolling_rows.append(
+            {
+                "trade_number": end,
+                "window_end_timestamp": window[-1].trade.exit_fill.timestamp,
+                "rolling_win_rate": Decimal(wins) / Decimal("20"),
+                "rolling_average_net_return": sum(
+                    (record.trade.net_return for record in window), start=ZERO
+                )
+                / Decimal("20"),
+                **_profit_factor_columns(factor),
+            }
+        )
+
+    holding_bounds = (
+        ("0-5", Decimal("0"), Decimal("5")),
+        (">5-15", Decimal("5"), Decimal("15")),
+        (">15-30", Decimal("15"), Decimal("30")),
+        (">30-60", Decimal("30"), Decimal("60")),
+        (">60-120", Decimal("60"), Decimal("120")),
+        (">120", Decimal("120"), None),
+    )
+    holding_rows = []
+    holding_values = [row["holding_minutes"] for row in diagnostic_rows]
+    for label, lower, upper in holding_bounds:
+        count = sum(
+            value >= lower
+            and (value <= upper if lower == 0 and upper is not None else True)
+            and (value > lower if lower > 0 else True)
+            and (upper is None or value <= upper)
+            for value in holding_values
+        )
+        holding_rows.append({"bucket": label, "trade_count": count})
+
+    costs = report.actual_costs
+    gross_profit = sum(
+        (record.trade.gross_pnl for record in records if record.trade.gross_pnl > 0),
+        start=ZERO,
+    )
+    gross_loss = -sum(
+        (record.trade.gross_pnl for record in records if record.trade.gross_pnl < 0),
+        start=ZERO,
+    )
+    cost_rows = [
+        {"component": "gross_profit", "amount": gross_profit},
+        {"component": "gross_loss_absolute", "amount": gross_loss},
+        *[
+            {"component": name, "amount": getattr(costs, name)}
+            for name in costs.component_percentages
+        ],
+        {"component": "final_net_pnl", "amount": report.performance.net_profit},
+    ]
+    request = report.request_outcomes
+    funnel_rows = [
+        {"stage": "generated_requests", "count": request.total_requests},
+        {
+            "stage": "allocated",
+            "count": request.completed_actual + request.allocated_entry_not_filled,
+        },
+        {
+            "stage": "capacity_rejected",
+            "count": request.capacity_rejected_request_count,
+        },
+        {
+            "stage": "filled",
+            "count": request.completed_actual + request.completed_shadow,
+        },
+        {
+            "stage": "not_filled",
+            "count": request.allocated_entry_not_filled
+            + request.shadow_entry_not_filled,
+        },
+        {
+            "stage": "completed",
+            "count": request.completed_actual + request.completed_shadow,
+        },
+    ]
+    shadow = report.shadow_metrics
+    comparison_rows = [
+        {
+            "economic_status": "ACTUAL",
+            "trade_count": report.performance.actual_trade_count,
+            "net_pnl": report.performance.net_profit,
+            "total_costs": report.performance.total_costs,
+            "win_rate": report.performance.win_rate,
+            "average_net_return": report.performance.average_net_return_per_trade,
+            **_profit_factor_columns(report.performance.net_profit_factor),
+        },
+        {
+            "economic_status": shadow.economic_status,
+            "trade_count": shadow.shadow_trade_count,
+            "net_pnl": shadow.hypothetical_net_pnl,
+            "total_costs": shadow.hypothetical_total_costs,
+            "win_rate": shadow.win_rate,
+            "average_net_return": shadow.average_net_return,
+            **_profit_factor_columns(shadow.profit_factor),
+        },
+    ]
+    return {
+        "cumulative_pnl": _frame(
+            cumulative_rows,
+            {
+                "trade_number": pl.Int64,
+                "exit_timestamp": pl.Datetime(
+                    time_unit="us", time_zone="Asia/Kolkata"
+                ),
+                "cumulative_gross_pnl": DECIMAL,
+                "cumulative_net_pnl": DECIMAL,
+                "cumulative_cost_drag": DECIMAL,
+            },
+        ),
+        "monthly_performance": monthly,
+        "side_performance": side,
+        "time_of_day_performance": time_of_day,
+        "holding_time_distribution": _frame(
+            holding_rows, {"bucket": pl.String, "trade_count": pl.Int64}
+        ),
+        "rolling_trade_metrics": _frame(
+            rolling_rows,
+            {
+                "trade_number": pl.Int64,
+                "window_end_timestamp": pl.Datetime(
+                    time_unit="us", time_zone="Asia/Kolkata"
+                ),
+                "rolling_win_rate": DECIMAL,
+                "rolling_average_net_return": DECIMAL,
+                "profit_factor": DECIMAL,
+                "profit_factor_is_unbounded": pl.Boolean,
+                "profit_factor_is_undefined": pl.Boolean,
+            },
+        ),
+        "trade_diagnostics": _frame(
+            diagnostic_rows,
+            {
+                "trade_number": pl.Int64,
+                "symbol": pl.String,
+                "side": pl.String,
+                "signal_timestamp": pl.Datetime(
+                    time_unit="us", time_zone="Asia/Kolkata"
+                ),
+                "entry_timestamp": pl.Datetime(
+                    time_unit="us", time_zone="Asia/Kolkata"
+                ),
+                "exit_timestamp": pl.Datetime(
+                    time_unit="us", time_zone="Asia/Kolkata"
+                ),
+                "holding_minutes": DECIMAL,
+                "mfe_return": DECIMAL,
+                "mae_return": DECIMAL,
+                "gross_return": DECIMAL,
+                "net_return": DECIMAL,
+            },
+        ),
+        "cost_impact": _frame(
+            cost_rows, {"component": pl.String, "amount": DECIMAL}
+        ),
+        "outcome_funnel": _frame(
+            funnel_rows, {"stage": pl.String, "count": pl.Int64}
+        ),
+        "actual_shadow_comparison": _frame(
+            comparison_rows,
+            {
+                "economic_status": pl.String,
+                "trade_count": pl.Int64,
+                "net_pnl": DECIMAL,
+                "total_costs": DECIMAL,
+                "win_rate": DECIMAL,
+                "average_net_return": DECIMAL,
+                "profit_factor": DECIMAL,
+                "profit_factor_is_unbounded": pl.Boolean,
+                "profit_factor_is_undefined": pl.Boolean,
+            },
+        ),
+    }
+
+
 def report_tables(report: ReportBundle) -> Mapping[str, pl.DataFrame]:
     """Return stable canonical Polars tables derived only from ``report``."""
     if not isinstance(report, ReportBundle):
@@ -454,6 +777,7 @@ def report_tables(report: ReportBundle) -> Mapping[str, pl.DataFrame]:
             },
         ),
     }
+    tables.update(_diagnostic_tables(report))
     return tables
 
 

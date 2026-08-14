@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated
+from types import MappingProxyType
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_serializer,
+    model_validator,
+)
 
 from algo_trader.costs import BrokeragePlan, RoundTripCostBreakdown
 from algo_trader.domain import ProtectiveExitSpec, Trade
@@ -38,15 +48,47 @@ class FrozenBacktestModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+class BacktestIntegrityError(RuntimeError):
+    """Raised when missing or inconsistent data prevents a valid run."""
+
+
+class DynamicExitPolicySpec(FrozenBacktestModel):
+    """Serializable deterministic configuration for a registered exit policy."""
+
+    policy_id: NonEmptyStr
+    parameters: Mapping[str, Any]
+
+    @model_validator(mode="after")
+    def detach_and_freeze_parameters(self) -> DynamicExitPolicySpec:
+        frozen: dict[str, object] = {}
+        for key in self.parameters:
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("dynamic exit parameter names must be non-empty strings")
+        for key in sorted(self.parameters):
+            value = self.parameters[key]
+            frozen[key] = _validate_policy_scalar(value, key)
+        object.__setattr__(self, "parameters", MappingProxyType(frozen))
+        return self
+
+    @field_serializer("parameters")
+    def serialize_parameters(self, value: Mapping[str, object]) -> dict[str, object]:
+        return dict(value)
+
+
 class BacktestTradeRequest(FrozenBacktestModel):
     """Fully specified trade intent supplied to the orchestration layer."""
 
     candidate: AllocationCandidate
     protective_exit: ProtectiveExitSpec | None = None
+    dynamic_exit_policy: DynamicExitPolicySpec | None = None
     strategy_exit_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_strategy_exit(self) -> BacktestTradeRequest:
+        if self.protective_exit is not None and self.dynamic_exit_policy is not None:
+            raise ValueError(
+                "protective_exit and dynamic_exit_policy cannot both be supplied"
+            )
         if self.strategy_exit_at is None:
             return self
         _validate_aware(self.strategy_exit_at, "strategy_exit_at")
@@ -59,6 +101,31 @@ class BacktestTradeRequest(FrozenBacktestModel):
         ):
             raise ValueError("strategy_exit_at must be on the candidate's trading date")
         return self
+
+
+def _validate_policy_scalar(value: object, name: str) -> object:
+    if value is None or type(value) in {str, bool, int}:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"dynamic exit parameter {name!r} must be finite")
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"dynamic exit parameter {name!r} must be finite")
+        return value
+    if isinstance(value, datetime):
+        _validate_aware(value, f"dynamic exit parameter {name!r}")
+        return value
+    if isinstance(value, time):
+        if value.tzinfo is not None:
+            raise ValueError(
+                f"dynamic exit parameter {name!r} must be a timezone-naive local clock time"
+            )
+        return value
+    raise TypeError(
+        f"dynamic exit parameter {name!r} must be a deterministic serializable scalar"
+    )
 
 
 class BacktestConfig(FrozenBacktestModel):
