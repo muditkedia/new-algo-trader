@@ -84,12 +84,17 @@ def build_market_data_manifest(
             schema = tuple(
                 (name, str(dtype)) for name, dtype in pl.read_parquet_schema(path).items()
             )
+            column_names = {name for name, _dtype in schema}
+            if "date" not in column_names:
+                raise ValueError(
+                    f"market-data Parquet is missing canonical 'date' column: {path}"
+                )
             summary = (
                 pl.scan_parquet(path)
                 .select(
                     pl.len().alias("row_count"),
-                    pl.col("timestamp").min().alias("first_timestamp"),
-                    pl.col("timestamp").max().alias("last_timestamp"),
+                    pl.col("date").min().alias("first_timestamp"),
+                    pl.col("date").max().alias("last_timestamp"),
                 )
                 .collect()
                 .row(0, named=True)

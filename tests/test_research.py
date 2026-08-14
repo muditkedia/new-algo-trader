@@ -269,13 +269,12 @@ def test_market_data_manifest_cache_preserves_strong_identity(tmp_path: Path) ->
     path = dataset / "AAA.parquet"
     pl.DataFrame(
         {
-            "timestamp": [NOW, NOW.replace(minute=5)],
+            "date": [NOW, NOW.replace(minute=5)],
             "open": [100.0, 101.0],
             "high": [101.0, 102.0],
             "low": [99.0, 100.0],
             "close": [100.5, 101.5],
             "volume": [10.0, 20.0],
-            "symbol": ["AAA", "AAA"],
         }
     ).write_parquet(path)
     cache = tmp_path / "cache.json"
