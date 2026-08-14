@@ -633,7 +633,11 @@ def test_runner_real_causality_preflight_is_non_vacuous() -> None:
     extended = pl.concat((candles, pl.DataFrame(future, schema=candles.schema)))
 
     class Store:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
         def load_candles(self, symbol, start, end):
+            self.calls.append(symbol)
             assert symbol == "TEST"
             return extended.clone()
 
@@ -643,8 +647,9 @@ def test_runner_real_causality_preflight_is_non_vacuous() -> None:
         time(9, 15),
         tzinfo=IST,
     )
+    store = Store()
     report = run_real_causality_gate(
-        store=Store(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
         coverages=(
             # A later-listed symbol must be ignored before calling load_candles;
             # otherwise its first timestamp is on/after the allowed history cutoff.
@@ -660,9 +665,18 @@ def test_runner_real_causality_preflight_is_non_vacuous() -> None:
                 last_timestamp=extended["timestamp"].item(-1),
                 row_count=extended.height,
             ),
+            # This valid later symbol must never be loaded after TEST yields
+            # the deterministic real signal used for the causality proof.
+            SymbolCoverage(
+                symbol="ZZZ",
+                first_timestamp=extended["timestamp"].item(0),
+                last_timestamp=extended["timestamp"].item(-1),
+                row_count=extended.height,
+            ),
         ),
         strategy=LiquidityShockReclaimStrategy(),
         allowed_end_exclusive=allowed_end_exclusive,
     )
     assert report.full_signal_count >= 1
     assert report.tested_prefix_count > 2
+    assert store.calls == ["TEST"]

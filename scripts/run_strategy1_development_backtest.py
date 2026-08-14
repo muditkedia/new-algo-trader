@@ -473,10 +473,14 @@ def run_real_causality_gate(
             if signal.timestamp < allowed_end
         ]
         if signals:
+            # The causality gate needs one deterministic real signal, not the
+            # globally earliest signal across the entire universe. Coverages are
+            # already traversed in stable symbol order, so the first qualifying
+            # signal is deterministic and avoids an unnecessary full-universe
+            # Strategy-1 rescan.
             first = signals[0]
-            candidate = (first.timestamp, coverage.symbol, first, candles)
-            if best is None or candidate[:2] < best[:2]:
-                best = candidate
+            best = (first.timestamp, coverage.symbol, first, candles)
+            break
 
     if best is None:
         raise RuntimeError(
