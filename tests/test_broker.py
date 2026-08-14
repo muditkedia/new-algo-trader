@@ -3,6 +3,7 @@ import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -648,9 +649,14 @@ class FakeWebSocket:
         self.kwargs = kwargs
         self.calls: list[tuple[str, object]] = []
         self.close_count = 0
+        self.connected = Event()
+        self.closed = Event()
 
     def connect(self):
         self.calls.append(("connect", None))
+        self.connected.set()
+        self.on_open(self)
+        self.closed.wait()
 
     def subscribe(self, correlation_id, mode, token_list):
         self.calls.append(("subscribe", (correlation_id, mode, copy.deepcopy(token_list))))
@@ -660,6 +666,7 @@ class FakeWebSocket:
 
     def close_connection(self):
         self.close_count += 1
+        self.closed.set()
 
 
 def test_websocket_is_explicit_deterministic_scaled_and_safe() -> None:
@@ -674,11 +681,13 @@ def test_websocket_is_explicit_deterministic_scaled_and_safe() -> None:
         websocket_factory=FakeWebSocket,
     )
     assert FakeWebSocket.constructions == 0
-    stream.connect()
+    instrument = instrument_master().resolve("RELIANCE")
+    stream.configure_initial_subscription((instrument,))
+    connection = Thread(target=stream.connect)
+    connection.start()
     assert FakeWebSocket.constructions == 1
     socket = stream._socket
-    instrument = instrument_master().resolve("RELIANCE")
-    stream.subscribe((instrument,))
+    assert socket.connected.wait(timeout=1)
     assert socket.calls[-1][1][2] == [
         {"exchangeType": NSE_CASH_EXCHANGE_TYPE, "tokens": ["2885"]}
     ]
@@ -711,6 +720,8 @@ def test_websocket_is_explicit_deterministic_scaled_and_safe() -> None:
         stream.subscribe((instrument,))
     stream.unsubscribe((instrument,))
     stream.close()
+    connection.join(timeout=1)
+    assert not connection.is_alive()
     stream.close()
     assert socket.close_count == 1
     assert socket.kwargs["max_retry_attempt"] == 0

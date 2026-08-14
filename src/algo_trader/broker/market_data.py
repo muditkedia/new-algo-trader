@@ -120,7 +120,18 @@ class AngelOneMarketDataStream:
         self._factory = websocket_factory
         self._socket: object | None = None
         self._instruments_by_token: dict[str, BrokerInstrument] = {}
+        self._initial_instruments: tuple[BrokerInstrument, ...] = ()
         self._closed = False
+
+    def configure_initial_subscription(
+        self, instruments: Sequence[BrokerInstrument]
+    ) -> None:
+        """Configure the exact subscription sent by SDK ``on_open``."""
+        if self._socket is not None:
+            raise RuntimeError("initial subscription must be configured before connect")
+        if self._initial_instruments:
+            raise RuntimeError("initial subscription is already configured")
+        self._initial_instruments = self._validated_instruments(instruments)
 
     def connect(self) -> None:
         """Construct and connect the SDK socket only on this explicit call."""
@@ -136,6 +147,7 @@ class AngelOneMarketDataStream:
             )
             socket.on_data = self._handle_data
             socket.on_error = self._handle_sdk_error
+            socket.on_open = self._handle_open
             self._socket = socket
             socket.connect()
         except Exception as error:
@@ -145,12 +157,13 @@ class AngelOneMarketDataStream:
     def subscribe(self, instruments: Sequence[BrokerInstrument]) -> None:
         """Subscribe exact unique NSE tokens in deterministic order."""
         socket = self._require_socket()
-        selected = tuple(sorted(instruments, key=lambda item: item.symbol_token))
-        if not selected:
-            raise ValueError("at least one instrument is required")
+        selected = self._validated_instruments(instruments)
+        self._subscribe_socket(socket, selected)
+
+    def _subscribe_socket(
+        self, socket: object, selected: tuple[BrokerInstrument, ...]
+    ) -> None:
         tokens = [item.symbol_token for item in selected]
-        if len(tokens) != len(set(tokens)):
-            raise BrokerDataError("duplicate instrument token in subscription")
         if any(token in self._instruments_by_token for token in tokens):
             raise BrokerDataError("instrument token is already subscribed")
         token_list = [{"exchangeType": NSE_CASH_EXCHANGE_TYPE, "tokens": tokens}]
@@ -159,6 +172,15 @@ class AngelOneMarketDataStream:
         except Exception as error:
             raise BrokerApiError("Angel One websocket subscription failed") from error
         self._instruments_by_token.update({item.symbol_token: item for item in selected})
+
+    def _handle_open(self, socket: object, *args: object) -> None:
+        del args
+        if not self._initial_instruments:
+            return
+        try:
+            self._subscribe_socket(socket, self._initial_instruments)
+        except (BrokerApiError, BrokerDataError) as error:
+            self._on_error_callback(error)
 
     def unsubscribe(self, instruments: Sequence[BrokerInstrument]) -> None:
         """Unsubscribe an exact deterministic set of currently mapped tokens."""
@@ -222,6 +244,18 @@ class AngelOneMarketDataStream:
 
     def _handle_sdk_error(self, *args: object) -> None:
         self._on_error_callback(BrokerDataError("Angel One websocket reported an error"))
+
+    @staticmethod
+    def _validated_instruments(
+        instruments: Sequence[BrokerInstrument],
+    ) -> tuple[BrokerInstrument, ...]:
+        selected = tuple(sorted(instruments, key=lambda item: item.symbol_token))
+        if not selected:
+            raise ValueError("at least one instrument is required")
+        tokens = [item.symbol_token for item in selected]
+        if len(tokens) != len(set(tokens)):
+            raise BrokerDataError("duplicate instrument token in subscription")
+        return selected
 
     def _require_socket(self) -> object:
         if self._socket is None:
