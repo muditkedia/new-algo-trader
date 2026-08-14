@@ -7,10 +7,14 @@ from algo_trader.strategies.causality import (
     assert_strategy_prefix_invariant,
 )
 from algo_trader.strategies.contract import Strategy
+from algo_trader.strategies.liquidity_shock_reclaim import (
+    LiquidityShockReclaimStrategy,
+)
 from algo_trader.strategies.validation import validate_strategy_input
 
 __all__ = [
     "STRATEGY_CAUSALITY_GATE_VERSION",
+    "LiquidityShockReclaimStrategy",
     "Strategy",
     "StrategyCausalityReport",
     "StrategyCausalityViolation",
