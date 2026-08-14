@@ -135,6 +135,8 @@ class RuntimeConfig(FrozenRuntimeModel):
     state_db_path: Path
     brokerage_plan: BrokeragePlan
     starting_capital: PositiveDecimal
+    paper_slippage_bps: Decimal = Field(ge=0, allow_inf_nan=False)
+    execution_policy_id: NonEmptyStr = "ADVERSE_FIXED_BPS_PER_FILL"
     live_order_submission_enabled: bool = False
     market_timezone: Literal["Asia/Kolkata"] = MARKET_TIMEZONE_NAME
     scheduler_misfire_grace_seconds: int = Field(default=60, strict=True, gt=0)
@@ -151,12 +153,44 @@ class RuntimeConfig(FrozenRuntimeModel):
         return value
 
 
+class RuntimeDynamicExitPolicy(FrozenRuntimeModel):
+    """Runtime representation of the frozen R_MULTIPLE_TRAILING_V1 policy."""
+
+    policy_id: Literal["R_MULTIPLE_TRAILING_V1"] = "R_MULTIPLE_TRAILING_V1"
+    initial_stop_price: PositiveDecimal
+    hard_target_r: PositiveDecimal
+    breakeven_trigger_r: PositiveDecimal
+    breakeven_stop_r: Decimal = Field(ge=0, allow_inf_nan=False)
+    profit_lock_trigger_r: PositiveDecimal
+    profit_lock_stop_r: Decimal = Field(ge=0, allow_inf_nan=False)
+    trailing_distance_r: PositiveDecimal
+
+
+class RuntimeDynamicExitState(FrozenRuntimeModel):
+    """Durable actual-fill trailing state; restart cannot loosen the stop."""
+
+    entry_price: PositiveDecimal
+    initial_stop: PositiveDecimal
+    risk: PositiveDecimal
+    current_stop: PositiveDecimal
+    best_favorable: PositiveDecimal
+    hard_target: PositiveDecimal
+    last_completed_bar_start: datetime | None = None
+
+
 class RuntimeTradePlan(FrozenRuntimeModel):
     """Already-generated and already-scored opportunity supplied to Runtime."""
 
     candidate: AllocationCandidate
     protective_exit: ProtectiveExitSpec | None = None
+    dynamic_exit_policy: RuntimeDynamicExitPolicy | None = None
     scrip_consent: bool = False
+
+    @model_validator(mode="after")
+    def validate_exit_policy(self) -> RuntimeTradePlan:
+        if self.protective_exit is not None and self.dynamic_exit_policy is not None:
+            raise ValueError("protective_exit and dynamic_exit_policy are mutually exclusive")
+        return self
 
 
 class RuntimeSessionRecord(FrozenRuntimeModel):
@@ -251,6 +285,8 @@ class RuntimePositionRecord(FrozenRuntimeModel):
     reservation: CapitalReservation | None = None
     entry_fill: Fill
     protective_exit: ProtectiveExitSpec | None = None
+    dynamic_exit_policy: RuntimeDynamicExitPolicy | None = None
+    dynamic_exit_state: RuntimeDynamicExitState | None = None
     is_shadow: bool = False
     mfe_return: Decimal = Field(default=Decimal("0"), ge=0, allow_inf_nan=False)
     mae_return: Decimal = Field(default=Decimal("0"), le=0, allow_inf_nan=False)
@@ -271,6 +307,8 @@ class RuntimePositionRecord(FrozenRuntimeModel):
             _require_aware(self.requested_exit_at, "requested_exit_at")
         if self.exit_filled_quantity > self.entry_fill.quantity:
             raise ValueError("exit_filled_quantity cannot exceed entry fill quantity")
+        if (self.dynamic_exit_policy is None) != (self.dynamic_exit_state is None):
+            raise ValueError("dynamic exit policy and state must be persisted together")
         if len(self.broker_exit_client_order_ids) != len(
             set(self.broker_exit_client_order_ids)
         ):

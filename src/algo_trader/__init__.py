@@ -2,6 +2,7 @@
 
 from algo_trader.domain import (
     ExitReason,
+    ExitReasonDetail,
     Fill,
     MLScore,
     OrderIntent,
@@ -15,6 +16,7 @@ from algo_trader.domain import (
 
 __all__ = [
     "ExitReason",
+    "ExitReasonDetail",
     "Fill",
     "MLScore",
     "OrderIntent",

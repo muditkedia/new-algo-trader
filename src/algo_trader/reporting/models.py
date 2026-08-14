@@ -35,6 +35,10 @@ class ReportContext(FrozenReportingModel):
     report_id: NonEmptyStr
     generated_at: datetime
     trading_dates: tuple[date, ...]
+    research_scope_id: str | None = None
+    plan_id: str | None = None
+    window_id: str | None = None
+    oos_result_fingerprint: str | None = None
 
     @field_validator("trading_dates", mode="before")
     @classmethod
@@ -60,6 +64,16 @@ class ReportContext(FrozenReportingModel):
             raise ValueError("trading_dates must not contain duplicates")
         if self.trading_dates != tuple(sorted(self.trading_dates)):
             raise ValueError("trading_dates must be chronological")
+        oos_values = (
+            self.research_scope_id,
+            self.plan_id,
+            self.window_id,
+            self.oos_result_fingerprint,
+        )
+        if any(value is not None for value in oos_values) and not all(
+            isinstance(value, str) and value.strip() for value in oos_values
+        ):
+            raise ValueError("pre-registration OOS context must be supplied as a complete set")
         return self
 
 

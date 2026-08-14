@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from datetime import date
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
@@ -29,3 +30,26 @@ class ExplicitTradingDayCalendar:
         if not isinstance(day, date):
             raise TypeError("day must be a date")
         return day in self._trading_dates
+
+
+def load_trading_day_calendar(path: Path) -> ExplicitTradingDayCalendar:
+    """Load one explicit ISO-date-per-line calendar; missing input fails closed."""
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"explicit trading calendar is required: {source}")
+    dates: list[date] = []
+    for line_number, raw in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        try:
+            dates.append(date.fromisoformat(value))
+        except ValueError as error:
+            raise ValueError(
+                f"invalid trading calendar date on line {line_number}: {value!r}"
+            ) from error
+    if not dates:
+        raise ValueError("explicit trading calendar must contain at least one date")
+    if len(dates) != len(set(dates)):
+        raise ValueError("explicit trading calendar must not contain duplicate dates")
+    return ExplicitTradingDayCalendar(dates)

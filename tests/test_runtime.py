@@ -50,9 +50,11 @@ from algo_trader.runtime import (
     RUNTIME_ARCHITECTURE_VERSION,
     Clock,
     ExplicitTradingDayCalendar,
+    FiveMinuteStrategyCycle,
     LiveExecutionGateway,
     PaperExecutionGateway,
     RuntimeConfig,
+    RuntimeDynamicExitPolicy,
     RuntimeExecutionGateway,
     RuntimeExitLifecycle,
     RuntimeMode,
@@ -70,8 +72,10 @@ from algo_trader.runtime import (
     TradingDayProvider,
     aggregate_broker_fills,
     candidate_fingerprint,
+    compose_runtime_application,
     get_completed_five_minute_candles,
     load_smartapi_credentials,
+    load_trading_day_calendar,
     point_bar_from_tick,
     run_smartapi_connectivity_check,
     runtime_client_order_id,
@@ -195,6 +199,7 @@ def config(
         state_db_path=tmp_path / "runtime.duckdb",
         brokerage_plan=BrokeragePlan.PLUS,
         starting_capital=capital,
+        paper_slippage_bps=Decimal("0"),
         live_order_submission_enabled=live_enabled,
     )
 
@@ -364,6 +369,7 @@ def test_clock_calendar_session_times_and_config_contract(tmp_path: Path) -> Non
             state_db_path=tmp_path / "x",
             brokerage_plan=BrokeragePlan.PLUS,
             starting_capital=Decimal("1"),
+            paper_slippage_bps=Decimal("5"),
         )
     for invalid_timeout in (True, 0, -1, float("nan"), float("inf")):
         with pytest.raises(ValidationError):
@@ -372,9 +378,26 @@ def test_clock_calendar_session_times_and_config_contract(tmp_path: Path) -> Non
                 state_db_path=tmp_path / "timeout.duckdb",
                 brokerage_plan=BrokeragePlan.PLUS,
                 starting_capital=Decimal("1"),
+                paper_slippage_bps=Decimal("5"),
                 stream_shutdown_timeout_seconds=invalid_timeout,
             )
     assert selected.model_dump()["stream_shutdown_timeout_seconds"] == 10.0
+    with pytest.raises(ValidationError, match="paper_slippage_bps"):
+        RuntimeConfig(
+            mode=RuntimeMode.PAPER,
+            state_db_path=tmp_path / "missing-slippage.duckdb",
+            brokerage_plan=BrokeragePlan.PLUS,
+            starting_capital=Decimal("100000"),
+        )
+    assert selected.paper_slippage_bps == 0
+
+    calendar_path = tmp_path / "calendar.txt"
+    with pytest.raises(FileNotFoundError, match="required"):
+        load_trading_day_calendar(calendar_path)
+    calendar_path.write_text("# verified NSE dates\n2026-08-14\n", encoding="utf-8")
+    assert load_trading_day_calendar(calendar_path).trading_dates == frozenset(
+        {TRADING_DATE}
+    )
 
 
 def test_deterministic_runtime_identity_uses_session_candidate_and_leg() -> None:
@@ -544,6 +567,108 @@ def test_paper_service_allocates_fills_protects_costs_and_updates_capital(
     assert runtime.economic_capital == before + trade.net_pnl
     assert runtime.portfolio_state.active_reservations == ()
     assert store.load_trades("session-1") == completed
+    store.close()
+
+
+def test_runtime_dynamic_trailing_state_is_completed_bar_causal_and_persisted(
+    tmp_path: Path,
+) -> None:
+    runtime, store, clock = service(tmp_path)
+    runtime.start()
+    dynamic_plan = RuntimeTradePlan(
+        candidate=candidate(),
+        dynamic_exit_policy=RuntimeDynamicExitPolicy(
+            initial_stop_price=Decimal("90"),
+            hard_target_r=Decimal("1.25"),
+            breakeven_trigger_r=Decimal("0.75"),
+            breakeven_stop_r=Decimal("0"),
+            profit_lock_trigger_r=Decimal("1"),
+            profit_lock_stop_r=Decimal("0.25"),
+            trailing_distance_r=Decimal("0.5"),
+        ),
+    )
+    runtime.process_plans((dynamic_plan,), decision_at=at(9, 16))
+    runtime.on_market_tick(tick("100", timestamp=at(9, 16)))
+    assert runtime.positions[0].dynamic_exit_state.current_stop == Decimal("90")
+    completed = pl.DataFrame(
+        {
+            "timestamp": [at(9, 20)],
+            "open": [100.0],
+            "high": [108.0],
+            "low": [99.0],
+            "close": [107.0],
+            "volume": [100.0],
+            "symbol": ["AAA"],
+        }
+    )
+    runtime.advance_dynamic_exits({"AAA": completed}, at(9, 25))
+    assert runtime.positions[0].dynamic_exit_state.current_stop == Decimal("100")
+    runtime.advance_dynamic_exits({"AAA": completed}, at(9, 25))
+    assert runtime.positions[0].dynamic_exit_state.current_stop == Decimal("100")
+    store.close()
+
+    reopened = RuntimeStateStore(config(tmp_path).state_db_path)
+    recovered = RuntimeService(
+        runtime_session_id="session-1",
+        trading_date=TRADING_DATE,
+        config=config(tmp_path),
+        clock=clock,
+        trading_calendar=ExplicitTradingDayCalendar([TRADING_DATE]),
+        state_store=reopened,
+        margin_provider=FixedMarginProvider(),
+    )
+    recovered.start()
+    assert recovered.positions[0].dynamic_exit_state.current_stop == Decimal("100")
+    reopened.close()
+
+
+def test_live_shadow_dynamic_trailing_advances_from_completed_bars(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    runtime, store, _ = service(
+        tmp_path,
+        mode=RuntimeMode.LIVE,
+        capital=Decimal("50000"),
+        margin=Decimal("40000"),
+        live_enabled=True,
+        broker=broker,
+    )
+    broker.state_store = store
+    runtime.start()
+    policy = RuntimeDynamicExitPolicy(
+        initial_stop_price=Decimal("90"),
+        hard_target_r=Decimal("1.25"),
+        breakeven_trigger_r=Decimal("0.75"),
+        breakeven_stop_r=Decimal("0"),
+        profit_lock_trigger_r=Decimal("1"),
+        profit_lock_stop_r=Decimal("0.25"),
+        trailing_distance_r=Decimal("0.5"),
+    )
+    actual = RuntimeTradePlan(candidate=candidate(symbol="AAA"), dynamic_exit_policy=policy)
+    shadow = RuntimeTradePlan(candidate=candidate(symbol="BBB"), dynamic_exit_policy=policy)
+    runtime.process_plans((actual, shadow), decision_at=at(9, 16))
+    runtime.on_market_tick(tick("100", symbol="BBB", timestamp=at(9, 16)))
+
+    runtime.advance_dynamic_exits(
+        {
+            "BBB": pl.DataFrame(
+                {
+                    "timestamp": [at(9, 20)],
+                    "open": [100.0],
+                    "high": [108.0],
+                    "low": [99.0],
+                    "close": [107.0],
+                    "volume": [100.0],
+                    "symbol": ["BBB"],
+                }
+            )
+        },
+        at(9, 25),
+    )
+
+    persisted = store.load_positions("session-1")
+    assert len(persisted) == 1
+    assert persisted[0].is_shadow
+    assert persisted[0].dynamic_exit_state.current_stop == Decimal("100")
     store.close()
 
 
@@ -961,6 +1086,14 @@ class FakeBroker:
         self.calls.append(("list_positions", None))
         return self.positions
 
+    def get_funds(self):
+        self.calls.append(("get_funds", None))
+        return BrokerFunds(
+            net=Decimal("1000000"),
+            available_cash=Decimal("1000000"),
+            available_limit_margin=Decimal("1000000"),
+        )
+
 
 def order_snapshot(
     *,
@@ -1043,6 +1176,31 @@ def test_live_interlock_persist_before_place_ack_not_fill_and_no_retry(tmp_path:
     assert store.load_positions("session-1") == ()
     assert [name for name, _ in broker.calls].count("place_order") == 1
     assert runtime.portfolio_state.reserved_margin == Decimal("20000")
+    store.close()
+
+
+def test_live_broker_funds_are_independent_upper_ceiling(tmp_path: Path) -> None:
+    class LowFundsBroker(FakeBroker):
+        def get_funds(self):
+            return BrokerFunds(
+                net=Decimal("1000"),
+                available_cash=Decimal("1000"),
+                available_limit_margin=Decimal("1000"),
+            )
+
+    broker = LowFundsBroker()
+    runtime, store, _ = service(
+        tmp_path,
+        mode=RuntimeMode.LIVE,
+        live_enabled=True,
+        broker=broker,
+    )
+    broker.state_store = store
+    runtime.start()
+    with pytest.raises(RuntimeError, match="broker funds ceiling"):
+        runtime.process_plans((plan(),), decision_at=at(9, 16))
+    assert runtime.phase is RuntimePhase.HALTED
+    assert not any(name == "place_order" for name, _ in broker.calls)
     store.close()
 
 
@@ -2476,6 +2634,44 @@ def test_completed_candles_respect_bar_availability_without_mutation() -> None:
     assert frame.equals(source)
 
 
+def test_five_minute_cycle_fetches_completed_data_and_health_checks_first(
+    tmp_path: Path,
+) -> None:
+    runtime, store, clock = service(tmp_path, current=at(9, 25))
+    runtime.start()
+    runtime.on_market_tick(tick("100", timestamp=at(9, 25)))
+    frame = pl.DataFrame(
+        {
+            "timestamp": [at(9, 15), at(9, 20)],
+            "open": [100.0, 100.0],
+            "high": [101.0, 101.0],
+            "low": [99.0, 99.0],
+            "close": [100.0, 100.0],
+            "volume": [100.0, 100.0],
+            "symbol": ["AAA", "AAA"],
+        }
+    )
+    calls = []
+
+    class Plans:
+        def plans_for_cycle(self, completed_candles, decision_at):
+            calls.append((completed_candles, decision_at, runtime.phase))
+            return ()
+
+    cycle = FiveMinuteStrategyCycle(
+        service=runtime,
+        clock=clock,
+        candle_client=FakeCandleClient(frame),
+        instruments=(master().resolve("AAA"),),
+        history_start={"AAA": at(9, 15)},
+        plan_provider=Plans(),
+    )
+    assert cycle() == ()
+    assert calls[0][0]["AAA"]["timestamp"].to_list() == [at(9, 15), at(9, 20)]
+    assert runtime.phase is RuntimePhase.TRADING
+    store.close()
+
+
 class FakeScheduler:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
@@ -2507,6 +2703,9 @@ class SchedulerService:
     def force_square_off(self, **kwargs):
         self.calls.append(("square", kwargs))
 
+    def market_close_check(self, **kwargs):
+        self.calls.append(("market-close", kwargs))
+
     def shutdown(self, **kwargs):
         self.calls.append(("shutdown", kwargs))
         return RuntimePhase.STOPPED
@@ -2523,14 +2722,14 @@ def test_scheduler_uses_explicit_date_jobs_deterministically() -> None:
     ids = runtime_scheduler.configure_date(
         TRADING_DATE, RuntimeSessionTimes(), "session-1"
     )
-    assert len(ids) == 4
+    assert len(ids) == 5
     assert runtime_scheduler.scheduler.kwargs["timezone"] == IST
     assert all(job[1]["max_instances"] == 1 for job in runtime_scheduler.scheduler.jobs.values())
     assert all(job[1]["coalesce"] is True for job in runtime_scheduler.scheduler.jobs.values())
     assert runtime_scheduler.configure_date(
         TRADING_DATE, RuntimeSessionTimes(), "session-1"
     ) == ids
-    assert len(runtime_scheduler.scheduler.jobs) == 4
+    assert len(runtime_scheduler.scheduler.jobs) == 5
     for callback, kwargs in runtime_scheduler.scheduler.jobs.values():
         callback()
         assert "kwargs" not in kwargs
@@ -2538,6 +2737,7 @@ def test_scheduler_uses_explicit_date_jobs_deterministically() -> None:
         "open",
         "cutoff",
         "square",
+        "market-close",
         "shutdown",
     ]
     assert RuntimeScheduler(
@@ -2545,6 +2745,75 @@ def test_scheduler_uses_explicit_date_jobs_deterministically() -> None:
         ExplicitTradingDayCalendar([]),
         scheduler_factory=FakeScheduler,
     ).configure_date(TRADING_DATE, RuntimeSessionTimes(), "x") == ()
+
+
+def test_runtime_composition_refuses_live_without_connectivity_preflight(
+    tmp_path: Path,
+) -> None:
+    runtime, store, clock = service(tmp_path)
+    scheduler = RuntimeScheduler(
+        runtime,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+
+    class Plans:
+        def plans_for_cycle(self, completed_candles, decision_at):
+            return ()
+
+    with pytest.raises(ValueError, match="connectivity preflight"):
+        compose_runtime_application(
+            config=config(tmp_path / "live", mode=RuntimeMode.LIVE),
+            service=runtime,
+            clock=clock,
+            candle_client=FakeCandleClient(pl.DataFrame()),
+            instruments=(master().resolve("AAA"),),
+            history_start={"AAA": at(9, 15)},
+            plan_provider=Plans(),
+            scheduler=scheduler,
+        )
+    store.close()
+
+
+def test_runtime_composition_wires_smartapi_connectivity_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from algo_trader.runtime import composition
+
+    runtime, store, clock = service(tmp_path)
+    scheduler = RuntimeScheduler(
+        runtime,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+    calls = []
+    monkeypatch.setattr(
+        composition,
+        "run_smartapi_connectivity_check",
+        lambda **kwargs: calls.append(kwargs) or "ok",
+    )
+
+    class Plans:
+        def plans_for_cycle(self, completed_candles, decision_at):
+            return ()
+
+    app = compose_runtime_application(
+        config=config(tmp_path / "live", mode=RuntimeMode.LIVE),
+        service=runtime,
+        clock=clock,
+        candle_client=FakeCandleClient(pl.DataFrame()),
+        instruments=(master().resolve("AAA"),),
+        history_start={"AAA": at(9, 15)},
+        plan_provider=Plans(),
+        scheduler=scheduler,
+        instrument_master=master(),
+    )
+    assert app.live_connectivity_preflight is not None
+    assert app.live_connectivity_preflight() == "ok"
+    assert calls[0]["checked_at"] == clock.now()
+    assert calls[0]["quote_symbol"] == "AAA"
+    store.close()
 
 
 def test_scheduler_keeps_scheduled_time_separate_from_actual_runtime_time(

@@ -488,6 +488,7 @@ class HistoricalBacktester:
             mfe_return=mfe_return,
             mae_return=mae_return,
             exit_reason=exit_result.exit_reason,
+            exit_reason_detail=exit_result.exit_reason_detail,
             is_shadow=decision.outcome is AllocationOutcome.CAPACITY_REJECTED,
         )
         return BacktestTradeRecord(

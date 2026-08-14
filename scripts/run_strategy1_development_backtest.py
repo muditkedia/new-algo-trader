@@ -5,8 +5,9 @@ import hashlib
 import json
 import os
 import subprocess
-from collections.abc import Iterable
-from datetime import UTC, date, datetime, time, timedelta
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict
+from datetime import UTC, date, datetime, time
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -25,6 +26,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 from algo_trader.backtest import (
+    BACKTESTER_VERSION,
     BacktestConfig,
     BacktestTradeRequest,
     DynamicExitPolicySpec,
@@ -50,9 +52,18 @@ from algo_trader.data import (
     SymbolCoverage,
     bar_available_at,
 )
-from algo_trader.domain import MLScore, OrderIntent, OrderType, Side, Signal
+from algo_trader.domain import (
+    MAX_NOTIONAL,
+    MIN_NOTIONAL,
+    NOTIONAL_INCREMENT,
+    MLScore,
+    OrderIntent,
+    OrderType,
+    Side,
+    Signal,
+)
 from algo_trader.execution import FixedBasisPointsSlippage, HistoricalExecutionSimulator
-from algo_trader.ml import BootstrapTradeScorer
+from algo_trader.ml import MetaFeatureSchema, TradeScorer
 from algo_trader.oos import (
     STANDARD_OOS_PARTITION_POLICY,
     OOSAuditContext,
@@ -61,17 +72,31 @@ from algo_trader.oos import (
     OOSWindowState,
     create_standard_oos_plan,
     derive_equity_data_horizon,
+    fingerprint_backtest_result,
     select_historically_available_equities,
     shift_calendar_months,
 )
 from algo_trader.portfolio import AllocationCandidate, MarginRequirementQuote, PortfolioState
 from algo_trader.reporting import (
+    REPORTING_VERSION,
     ReportBundle,
     ReportContext,
     build_report,
     report_tables,
     write_report_dataset,
     write_visual_report,
+)
+from algo_trader.research import (
+    ResearchDecisionRecord,
+    build_market_data_manifest,
+    build_review_artifacts,
+    canonical_fingerprint,
+    discover_research_runs,
+    environment_snapshot,
+    finalize_staging_run_directory,
+    prepare_staging_run_directory,
+    score_and_build_requests,
+    select_scope_trade_scorer,
 )
 from algo_trader.runtime import load_smartapi_credentials
 from algo_trader.strategies import assert_strategy_prefix_invariant
@@ -92,19 +117,19 @@ RESULTS_ROOT = (
     / "liquidity-shock-exhaustion-reclaim"
 )
 OOS_REGISTRY_PATH = RESULTS_ROOT / "oos_registry.duckdb"
-MASTER_EXCEL_PATH = RESULTS_ROOT / "strategy1_research_master.xlsx"
-MASTER_JSON_PATH = RESULTS_ROOT / "strategy1_research_history.json"
+UPLOAD_REVIEW_DIR = RESULTS_ROOT / "UPLOAD_FOR_REVIEW"
+MASTER_EXCEL_PATH = UPLOAD_REVIEW_DIR / "strategy1_research_master.xlsx"
+MASTER_JSON_PATH = UPLOAD_REVIEW_DIR / "strategy1_research_history.json"
 MASTER_VISUAL_DIR = RESULTS_ROOT / "research_visuals"
 MARGIN_SNAPSHOT_DIR = RESULTS_ROOT / "margin_snapshots"
+MARKET_DATA_FINGERPRINT_CACHE = RESULTS_ROOT / "market_data_fingerprint_cache.json"
+MODEL_ROOT = RESULTS_ROOT / "models"
+HISTORICAL_SYMBOL_ALIAS_PATH = RESULTS_ROOT / "historical_symbol_aliases.json"
 
 RESEARCH_SCOPE_ID = "liquidity-shock-exhaustion-reclaim"
 PLAN_ID = "liquidity-shock-exhaustion-reclaim-standard-v1"
 
 INITIAL_CAPITAL = Decimal("100000")
-BASE_NOTIONAL = 50_000
-MAX_NOTIONAL = 100_000
-NOTIONAL_STEP = 5_000
-
 # Explicit research assumption. This is intentionally not a strategy parameter.
 DEFAULT_SLIPPAGE_BPS = Decimal("5")
 DEFAULT_BROKERAGE_PLAN = BrokeragePlan.PLUS
@@ -115,76 +140,75 @@ DEFAULT_BROKERAGE_PLAN = BrokeragePlan.PLUS
 DEVELOPMENT_EVALUATION_MONTHS = 3
 
 MARGIN_REFERENCE_NOTIONAL = 100_000
-LATEST_STRATEGY_EXIT_TIME = time(15, 10)
 FORCED_BACKTEST_EXIT_TIME = time(15, 25)
 
 BOOTSTRAP_MODEL_VERSION = "bootstrap-neutral-v1"
 DYNAMIC_EXIT_POLICY_ID = "R_MULTIPLE_TRAILING_V1"
+STRATEGY1_META_FEATURE_SCHEMA = MetaFeatureSchema(
+    feature_names=(
+        "shock_return",
+        "shock_robust_z",
+        "relative_volume",
+        "median_daily_turnover",
+        "atr",
+        "penetration_atr",
+        "reclaim_atr",
+        "confirmation_return_from_event_close",
+    )
+)
 
-# Curated research decisions are intentionally explicit rather than inferred from performance.
-# Each strategy revision updates this history so the two upload artifacts preserve not only
-# numerical results, but also what changed, why it changed, and the next governed action.
-RESEARCH_DECISION_HISTORY: tuple[dict[str, object], ...] = (
-    {
-        "sequence": 1,
-        "strategy_version": "1.0.0",
-        "phase": "development",
-        "result": "FAILED",
-        "actual_trades": 162,
-        "net_profit": "-19502.48764415068104661877811",
-        "win_rate": "0.2530864197530864197530864198",
-        "net_profit_factor": "0.1866319084700740110969112158",
-        "average_net_return_per_trade": "-0.002411492744252698845966138186",
-        "trades_per_day": "2.655737704918032786885245902",
-        "maximum_realized_drawdown_pct": "0.1961371189003785863389663773",
-        "decision": "ITERATE_IN_DEVELOPMENT",
-        "analysis": (
-            "The broad baseline had negative gross expectancy before costs. High frequency did "
-            "not compensate for weak setup quality; costs amplified an already-negative edge."
+# Human decisions link to canonical artifacts; numerical metrics remain owned by those artifacts.
+RESEARCH_DECISION_HISTORY = (
+    ResearchDecisionRecord(
+        decision_id="strategy1-v1.0-development-review",
+        source_run_ids=(
+            "strategy1-development-2016-12-29-to-2017-03-29-1.0.0-a289fe2e087f",
         ),
-        "changes_to_next_version": (
-            "v1.1.0: restrict structural levels to PDH/PDL only; raise same-slot RVOL threshold "
-            "from 2x to 12x; reduce hard target/trailing hard target from 1.5R to 1.25R. "
-            "Keep shock-z, ATR penetration/reclaim geometry, confirmation timing, stop geometry, "
-            "trailing triggers, hold time, symmetry, allocator, costs, and OOS policy unchanged."
+        strategy_id=RESEARCH_SCOPE_ID,
+        strategy_version="1.0.0",
+        research_scope_id=RESEARCH_SCOPE_ID,
+        decision="ITERATE_IN_DEVELOPMENT",
+        diagnosis="The broad baseline had negative gross expectancy before costs.",
+        changes_authorized=(
+            "Restrict levels to PDH/PDL, require 12x relative volume, and use 1.25R target.",
         ),
-        "rationale": (
-            "Prior-day extremes are cleaner liquidity pools; extreme relative volume selects "
-            "genuine exhaustion events; the modestly closer target reduces give-back without "
-            "rewriting the exit architecture."
+        changes_rejected=("Changes to frozen allocator, costs, and OOS policy.",),
+        next_action="Run v1.1.0 on the same frozen development interval.",
+        recorded_at=datetime.fromisoformat("2026-08-14T21:02:11+05:30"),
+        git_commit="ed1c40f",
+    ),
+    ResearchDecisionRecord(
+        decision_id="strategy1-v1.1-development-review",
+        source_run_ids=(
+            "strategy1-development-2016-12-29-to-2017-03-29-1.1.0-6d8908a13d44",
         ),
-        "next_action": "Run v1.1.0 on the same frozen development interval.",
-    },
-    {
-        "sequence": 2,
-        "strategy_version": "1.1.0",
-        "phase": "development",
-        "result": "PROMISING_RESEARCH_CANDIDATE",
-        "actual_trades": 12,
-        "net_profit": "1059.8702040205760457377932",
-        "win_rate": "0.75",
-        "net_profit_factor": "3.151103739986594739363932352",
-        "average_net_return_per_trade": "0.001773841990335495980511404343",
-        "trades_per_day": "0.1967213114754098360655737705",
-        "maximum_realized_drawdown_pct": "0.002204734360786662541483554752",
-        "decision": "ADVANCE_UNCHANGED_TO_OOS_001",
-        "analysis": (
-            "v1.1.0 reversed the baseline into positive gross and net expectancy, with 75% win "
-            "rate, net PF above 3, balanced LONG/SHORT participation, and very low realized "
-            "drawdown. CAGR and average net return remain below final gates, but only 12 "
-            "development trades exist. Further threshold tuning on those 12 observations would "
-            "be development-sample overfitting."
+        strategy_id=RESEARCH_SCOPE_ID,
+        strategy_version="1.1.0",
+        research_scope_id=RESEARCH_SCOPE_ID,
+        decision="ADVANCE_UNCHANGED_TO_OOS_001",
+        diagnosis="Promising but small-sample development evidence required untouched data.",
+        changes_authorized=(),
+        changes_rejected=("Further threshold tuning on the development sample.",),
+        next_action="Run v1.1.0 unchanged on the governed OOS-001 window.",
+        recorded_at=datetime.fromisoformat("2026-08-14T22:02:36+05:30"),
+        git_commit="e5a1ab8",
+    ),
+    ResearchDecisionRecord(
+        decision_id="strategy1-v1.1-oos-001-review",
+        source_run_ids=(
+            "strategy1-oos-2017-03-29-to-2017-06-29-1.1.0-373f87db4491",
         ),
-        "changes_to_next_version": "None. Keep v1.1.0 unchanged for OOS-001.",
-        "rationale": (
-            "The next information gain must come from untouched data. OOS-001 is the governed "
-            "test of whether the improved development edge generalizes."
-        ),
-        "next_action": (
-            "Run v1.1.0 unchanged with --mode next-oos. Review OOS-001 before authorization or "
-            "any later strategy revision."
-        ),
-    },
+        strategy_id=RESEARCH_SCOPE_ID,
+        strategy_version="1.1.0",
+        research_scope_id=RESEARCH_SCOPE_ID,
+        decision="OOS_001_FAILED_DO_NOT_RETEST",
+        diagnosis="OOS-001 failed materially and is now inspected research evidence.",
+        changes_authorized=("Repair platform integration before further strategy research.",),
+        changes_rejected=("Reuse OOS-001 as a fresh test or tune directly on it.",),
+        next_action="Complete integration repair before any Strategy 1 v1.2 research.",
+        recorded_at=datetime.fromisoformat("2026-08-14T22:33:22+05:30"),
+        git_commit="78f74d0",
+    ),
 )
 
 
@@ -338,10 +362,12 @@ def finite_profit_factor(report: ReportBundle) -> float | None:
 def ceil_notional_bucket(price: Decimal) -> int | None:
     if not price.is_finite() or price <= 0:
         raise ValueError("decision price must be finite and positive")
-    required = max(Decimal(BASE_NOTIONAL), price)
+    required = max(Decimal(MIN_NOTIONAL), price)
     bucket = int(
-        (required / Decimal(NOTIONAL_STEP)).to_integral_value(rounding=ROUND_CEILING)
-    ) * NOTIONAL_STEP
+        (required / Decimal(NOTIONAL_INCREMENT)).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    ) * NOTIONAL_INCREMENT
     if bucket > MAX_NOTIONAL:
         return None
     return bucket
@@ -417,42 +443,75 @@ def derive_earliest_strategy_ready(
 def run_real_causality_gate(
     *,
     store: ParquetMarketDataStore,
-    coverage_by_symbol: dict[str, SymbolCoverage],
+    coverages: tuple[SymbolCoverage, ...],
     strategy: LiquidityShockReclaimStrategy,
-    symbol: str,
-    ready_at: datetime,
+    allowed_end_exclusive: date,
 ) -> StrategyCausalityReport:
-    coverage = coverage_by_symbol[symbol]
-    if coverage.first_timestamp is None:
-        raise RuntimeError("Causality-gate symbol has no first timestamp.")
-
-    gate_end = ready_at + timedelta(minutes=5)
-    candles = store.load_candles(
-        symbol,
-        coverage.first_timestamp,
-        gate_end,
-    ).head(strategy.warmup_bars + 1)
-
-    expected_rows = strategy.warmup_bars + 1
-    if candles.height != expected_rows:
-        raise RuntimeError(
-            f"Causality-gate frame expected {expected_rows} rows, got {candles.height}."
+    """Prove Strategy 1 on a real signal drawn only from allowed research history."""
+    allowed_end = as_ist_midnight(allowed_end_exclusive)
+    excluded = set(STANDARD_OOS_PARTITION_POLICY.excluded_reference_symbols)
+    best: tuple[datetime, str, Signal, pl.DataFrame] | None = None
+    for coverage in sorted(coverages, key=lambda item: item.symbol):
+        if (
+            coverage.symbol in excluded
+            or coverage.first_timestamp is None
+            or coverage.row_count < strategy.warmup_bars + 3
+        ):
+            continue
+        candles = store.load_candles(
+            coverage.symbol,
+            coverage.first_timestamp,
+            allowed_end,
         )
+        if candles.height < strategy.warmup_bars + 3:
+            continue
+        signals = [
+            signal
+            for signal in strategy.generate_signals(candles)
+            if signal.timestamp < allowed_end
+        ]
+        if signals:
+            first = signals[0]
+            candidate = (first.timestamp, coverage.symbol, first, candles)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
 
-    return assert_strategy_prefix_invariant(strategy, candles)
+    if best is None:
+        raise RuntimeError(
+            "Causality preflight found no real Strategy-1 signal in development or "
+            "TRAINING_ALLOWED history."
+        )
+    _, symbol, target_signal, source = best
+    availability = [bar_available_at(value) for value in source["timestamp"].to_list()]
+    knowledge_rows = sum(value <= target_signal.timestamp for value in availability)
+    future_rows = min(source.height, knowledge_rows + 8)
+    start = max(0, knowledge_rows - strategy.warmup_bars)
+    bounded = source.slice(start, future_rows - start)
+
+    while target_signal not in strategy.generate_signals(bounded) and start > 0:
+        start = max(0, start - 250)
+        bounded = source.slice(start, future_rows - start)
+
+    bounded_signals = strategy.generate_signals(bounded)
+    if target_signal not in bounded_signals:
+        raise RuntimeError("Causality preflight could not preserve the located signal identity.")
+    report = assert_strategy_prefix_invariant(strategy, bounded)
+    if report.full_signal_count < 1 or report.tested_prefix_count <= 2:
+        raise RuntimeError(
+            "Causality preflight is vacuous: it requires a real signal and more than two "
+            "semantic prefixes."
+        )
+    if report.symbol != symbol:
+        raise RuntimeError("Causality preflight reported an unexpected symbol.")
+    return report
 
 
-def build_request(signal: Signal) -> BacktestTradeRequest | None:
+def build_request(signal: Signal, score: MLScore) -> BacktestTradeRequest | None:
     feature = signal.feature_snapshot
     decision_price = Decimal(str(feature["confirmation_close"]))
-    target_notional = ceil_notional_bucket(decision_price)
-    if target_notional is None:
+    if ceil_notional_bucket(decision_price) is None:
         return None
-
-    score = BootstrapTradeScorer(
-        model_version=BOOTSTRAP_MODEL_VERSION,
-        recommended_notional=target_notional,
-    ).score(signal)
+    target_notional = score.recommended_notional
 
     candidate = AllocationCandidate(
         order_intent=OrderIntent(
@@ -478,7 +537,9 @@ def build_request(signal: Signal) -> BacktestTradeRequest | None:
                 "profit_lock_stop_r": feature["trailing_profit_lock_stop_r"],
                 "trailing_distance_r": feature["trailing_distance_r"],
                 "maximum_hold_minutes": feature["maximum_hold_minutes"],
-                "latest_exit_time": LATEST_STRATEGY_EXIT_TIME,
+                "latest_exit_time": time.fromisoformat(
+                    str(signal.strategy_parameters["latest_exit_time"])
+                ),
             },
         ),
     )
@@ -489,6 +550,7 @@ def generate_requests(
     store: ParquetMarketDataStore,
     coverages: tuple[SymbolCoverage, ...],
     strategy: LiquidityShockReclaimStrategy,
+    scorer: TradeScorer,
     window_start: date,
     window_end: date,
 ) -> tuple[
@@ -546,14 +608,10 @@ def generate_requests(
         ]
         raw_signal_count += len(signals)
 
-        accepted = 0
-        for signal in signals:
-            request = build_request(signal)
-            if request is None:
-                skipped_expensive += 1
-                continue
-            requests.append(request)
-            accepted += 1
+        built = score_and_build_requests(signals, scorer, build_request)
+        accepted = len(built)
+        skipped_expensive += len(signals) - accepted
+        requests.extend(built)
 
         if signals:
             print(
@@ -596,11 +654,14 @@ def required_margin_pairs(
 def latest_margin_snapshot() -> HistoricalMarginSnapshot | None:
     if not MARGIN_SNAPSHOT_DIR.exists():
         return None
-    for path in sorted(MARGIN_SNAPSHOT_DIR.glob("*.json"), reverse=True):
+    paths = sorted(MARGIN_SNAPSHOT_DIR.glob("*.json"), reverse=True)
+    if paths:
         try:
-            return load_historical_margin_snapshot(path)
-        except Exception:
-            continue
+            return load_historical_margin_snapshot(paths[0])
+        except Exception as error:
+            raise RuntimeError(
+                f"Latest margin snapshot is corrupt or unreadable: {paths[0]}"
+            ) from error
     return None
 
 
@@ -622,6 +683,14 @@ def capture_or_expand_margin_snapshot(
         return None
 
     previous = latest_margin_snapshot()
+    requested_as_of = captured_at.astimezone(IST).date()
+    if previous is not None and previous.source_as_of_date != requested_as_of:
+        print(
+            "Existing margin snapshot is stale for the requested fixed-current policy: "
+            f"snapshot_as_of={previous.source_as_of_date} requested_as_of={requested_as_of}. "
+            "A fresh complete snapshot is required."
+        )
+        previous = None
     entries = snapshot_entries_by_pair(previous)
     missing = sorted(pairs - set(entries), key=lambda item: (item[0], item[1].value))
     if not missing and previous is not None:
@@ -635,6 +704,15 @@ def capture_or_expand_margin_snapshot(
 
     credentials = load_smartapi_credentials()
     instrument_master = fetch_instrument_master()
+    if HISTORICAL_SYMBOL_ALIAS_PATH.exists():
+        aliases = json.loads(HISTORICAL_SYMBOL_ALIAS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(aliases, Mapping):
+            raise RuntimeError("historical symbol alias file must contain a JSON object")
+        instrument_master = instrument_master.with_aliases(aliases)
+        print(
+            "Loaded explicit historical symbol aliases: "
+            f"{len(aliases)} from {HISTORICAL_SYMBOL_ALIAS_PATH}"
+        )
     broker = AngelOneBroker(instrument_master)
     session = None
     unresolved: list[str] = []
@@ -642,11 +720,8 @@ def capture_or_expand_margin_snapshot(
     try:
         session = broker.authenticate(credentials, captured_at)
 
-        # The architecture exposes AngelOneLiveMarginProvider but AngelOneBroker does not yet expose
-        # a public live-margin-provider accessor. Reuse the authenticated SDK instance rather than
-        # reimplementing SmartAPI authentication or margin payload semantics.
         live_margin = AngelOneLiveMarginProvider(
-            broker._require_sdk(),  # noqa: SLF001 - intentional research wiring bridge
+            broker.authenticated_client(),
             instrument_master,
         )
 
@@ -701,7 +776,10 @@ def capture_or_expand_margin_snapshot(
                 entries[(symbol, side)] = entry
                 print(
                     f"  margin {index}/{len(missing)} {symbol}/{side.value}: "
-                    f"fraction={entry.required_margin_fraction}"
+                    f"required≈₹{entry.broker_required_margin:,.2f} per "
+                    f"₹{entry.reference_notional:,.2f} exposure | "
+                    f"margin={entry.required_margin_fraction * 100:.2f}% | "
+                    f"implied_exposure≈{Decimal('1') / entry.required_margin_fraction:.2f}x"
                 )
             except BrokerSystemicError as error:
                 raise RuntimeError(
@@ -869,6 +947,7 @@ def stable_run_id(
     runner_sha256: str,
     brokerage_plan: BrokeragePlan,
     slippage_bps: Decimal,
+    run_input_fingerprint: str,
 ) -> str:
     material = "|".join(
         (
@@ -880,6 +959,7 @@ def stable_run_id(
             runner_sha256,
             brokerage_plan.value,
             str(slippage_bps),
+            run_input_fingerprint,
         )
     )
     suffix = hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
@@ -893,7 +973,7 @@ def write_json_model(path: Path, model: object) -> None:
     if path.exists():
         raise FileExistsError(f"artifact already exists: {path}")
     if hasattr(model, "model_dump_json"):
-        text = model.model_dump_json(indent=2)
+        text = model.model_dump_json(indent=2, exclude_computed_fields=True)
     else:
         raise TypeError("model must support model_dump_json")
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -920,6 +1000,7 @@ def write_run_manifest(
     slippage_bps: Decimal,
     margin_snapshot_id: str | None,
     causality: StrategyCausalityReport,
+    reproducibility: dict[str, object],
 ) -> None:
     payload = {
         "phase": phase,
@@ -961,6 +1042,8 @@ def write_run_manifest(
         "slippage_bps_per_fill": str(slippage_bps),
         "margin_snapshot_id": margin_snapshot_id,
         "dynamic_exit_policy_id": DYNAMIC_EXIT_POLICY_ID,
+        "run_input_fingerprint": reproducibility["run_input_fingerprint"],
+        "reproducibility": reproducibility,
         "causality_gate": {
             "gate_version": causality.gate_version,
             "strategy_id": causality.strategy_id,
@@ -981,26 +1064,11 @@ def write_run_manifest(
 
 
 def _run_artifacts() -> list[tuple[ReportBundle, dict[str, object], Path]]:
-    artifacts: list[tuple[ReportBundle, dict[str, object], Path]] = []
-    if not RESULTS_ROOT.exists():
-        return artifacts
-    for report_path in RESULTS_ROOT.rglob("report_bundle.json"):
-        manifest_path = report_path.with_name("run_manifest.json")
-        if not manifest_path.exists():
-            continue
-        try:
-            report = ReportBundle.model_validate_json(report_path.read_text(encoding="utf-8"))
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        artifacts.append((report, manifest, report_path.parent))
-    artifacts.sort(
-        key=lambda item: (
-            str(item[1].get("completed_at", "")),
-            item[0].provenance.run_id,
-        )
-    )
-    return artifacts
+    discovery = discover_research_runs(RESULTS_ROOT)
+    return [
+        (run.report, dict(run.manifest), run.directory)
+        for run in discovery.completed
+    ]
 
 
 def _excel_value(value: object) -> object:
@@ -1110,7 +1178,7 @@ def _run_history_rows(
 
 
 def _research_decision_rows() -> list[dict[str, object]]:
-    return [dict(row) for row in RESEARCH_DECISION_HISTORY]
+    return [row.model_dump(mode="json") for row in RESEARCH_DECISION_HISTORY]
 
 
 def rebuild_master_json(plan: OOSPlan | None) -> None:
@@ -1631,6 +1699,8 @@ def run_window(
     window_start: date,
     window_end: date,
     strategy: LiquidityShockReclaimStrategy,
+    scorer: TradeScorer,
+    scorer_provenance: dict[str, object],
     store: ParquetMarketDataStore,
     coverages: tuple[SymbolCoverage, ...],
     data_start: date,
@@ -1657,6 +1727,7 @@ def run_window(
         store=store,
         coverages=coverages,
         strategy=strategy,
+        scorer=scorer,
         window_start=window_start,
         window_end=window_end,
     )
@@ -1677,6 +1748,53 @@ def run_window(
         captured_at=captured_at,
     )
 
+    data_manifest, data_subset_fingerprint = build_market_data_manifest(
+        tuple(DATA_PATH / f"{symbol}.parquet" for symbol in scanned_symbols),
+        dataset_root=DATA_PATH,
+        cache_path=MARKET_DATA_FINGERPRINT_CACHE,
+    )
+    strategy_config_fingerprint = canonical_fingerprint(dict(strategy.parameters))
+    margin_snapshot_fingerprint = (
+        canonical_fingerprint(
+            margin_snapshot.model_dump(mode="json", exclude_computed_fields=True)
+        )
+        if margin_snapshot is not None
+        else None
+    )
+    scorer_kind = str(scorer_provenance["scorer_kind"])
+    reproducibility: dict[str, object] = {
+        "data_subset_fingerprint": data_subset_fingerprint,
+        "data_manifest": [asdict(record) for record in data_manifest],
+        "margin_snapshot_fingerprint": margin_snapshot_fingerprint,
+        "margin_snapshot_id": (
+            margin_snapshot.snapshot_id if margin_snapshot is not None else None
+        ),
+        "ml_scorer_kind": scorer_kind,
+        "ml_model_version": (
+            BOOTSTRAP_MODEL_VERSION
+            if scorer_kind == "BOOTSTRAP"
+            else getattr(getattr(scorer, "metadata", None), "model_version", "UNKNOWN")
+        ),
+        "ml_artifact_fingerprint": scorer_provenance.get("artifact_fingerprint"),
+        "ml_feature_schema": STRATEGY1_META_FEATURE_SCHEMA.model_dump(mode="json"),
+        "ml_training_data_lineage_fingerprint": scorer_provenance.get(
+            "training_data_lineage_fingerprint"
+        ),
+        "ml_evaluation_identity": scorer_provenance.get("evaluation_identity"),
+        "ml_selection_reason": scorer_provenance["reason"],
+        "strategy_config_fingerprint": strategy_config_fingerprint,
+        "cost_policy": f"FIXED_CURRENT:{brokerage_plan.value}",
+        "slippage_policy": "ADVERSE_FIXED_BPS_PER_FILL",
+        "slippage_bps_per_fill": str(slippage_bps),
+        "backtester_version": BACKTESTER_VERSION,
+        "reporting_version": REPORTING_VERSION,
+        "environment": environment_snapshot(),
+        "runner_sha256": runner_sha256,
+        "git_commit": git_commit,
+        "git_state": runner_git_state,
+    }
+    reproducibility["run_input_fingerprint"] = canonical_fingerprint(reproducibility)
+
     run_id = stable_run_id(
         phase=phase,
         strategy_version=strategy.strategy_version,
@@ -1686,14 +1804,26 @@ def run_window(
         runner_sha256=runner_sha256,
         brokerage_plan=brokerage_plan,
         slippage_bps=slippage_bps,
+        run_input_fingerprint=str(reproducibility["run_input_fingerprint"]),
     )
-    run_dir = RESULTS_ROOT / "runs" / run_id
-    if run_dir.exists():
-        raise FileExistsError(
-            "This exact research configuration has already been run. "
-            f"Existing artifact directory: {run_dir}"
-        )
-    run_dir.mkdir(parents=True, exist_ok=False)
+    current_oos_window = None
+    if phase == "oos":
+        if oos_registry is None or oos_plan is None:
+            raise RuntimeError("OOS run requires the persistent OOS registry and plan.")
+        current_oos_window = oos_registry.next_testable_window(RESEARCH_SCOPE_ID, PLAN_ID)
+        if current_oos_window is None:
+            raise RuntimeError(
+                "No OOS window is currently testable. Review/authorize the prior TESTED window "
+                "before attempting another OOS run."
+            )
+        if (
+            current_oos_window.start_date != window_start
+            or current_oos_window.end_date != window_end
+        ):
+            raise RuntimeError("Requested OOS window is not the registry's next testable window.")
+    run_dir, final_run_dir = prepare_staging_run_directory(
+        RESULTS_ROOT / "runs", run_id
+    )
 
     backtester = create_backtester(
         store=store,
@@ -1716,41 +1846,18 @@ def run_window(
     # Persist the exact immutable backtest result before any OOS state mutation.
     write_json_model(run_dir / "backtest_result.json", result)
 
-    oos_record = None
-    if phase == "oos":
-        if oos_registry is None or oos_plan is None:
-            raise RuntimeError("OOS run requires the persistent OOS registry and plan.")
-        current = oos_registry.next_testable_window(RESEARCH_SCOPE_ID, PLAN_ID)
-        if current is None:
-            raise RuntimeError(
-                "No OOS window is currently testable. Review/authorize the prior TESTED window "
-                "before attempting another OOS run."
-            )
-        if current.start_date != window_start or current.end_date != window_end:
-            raise RuntimeError("Requested OOS window is not the registry's next testable window.")
-
-        oos_record = oos_registry.register_test_result(
-            RESEARCH_SCOPE_ID,
-            PLAN_ID,
-            current.window_id,
-            result,
-            OOSAuditContext(
-                event_id=f"strategy1-oos-test-{uuid4().hex}",
-                occurred_at=captured_at,
-                git_commit=git_commit,
-            ),
-            tested_strategy_versions=((strategy.strategy_id, strategy.strategy_version),),
-            scanned_symbols=scanned_symbols,
-        )
-
+    result_fingerprint = fingerprint_backtest_result(result)
     report = build_report(
         result,
         ReportContext(
             report_id=f"{run_id}-report",
             generated_at=captured_at,
             trading_dates=trading_dates,
+            research_scope_id=(RESEARCH_SCOPE_ID if current_oos_window else None),
+            plan_id=(PLAN_ID if current_oos_window else None),
+            window_id=(current_oos_window.window_id if current_oos_window else None),
+            oos_result_fingerprint=(result_fingerprint if current_oos_window else None),
         ),
-        oos_test_record=oos_record,
     )
 
     # Canonical per-run machine-readable derivatives.
@@ -1782,7 +1889,26 @@ def run_window(
             margin_snapshot.snapshot_id if margin_snapshot is not None else None
         ),
         causality=causality,
+        reproducibility=reproducibility,
     )
+
+    finalized_run_dir = finalize_staging_run_directory(run_dir, final_run_dir)
+
+    if current_oos_window is not None:
+        assert oos_registry is not None
+        oos_registry.register_test_result(
+            RESEARCH_SCOPE_ID,
+            PLAN_ID,
+            current_oos_window.window_id,
+            result,
+            OOSAuditContext(
+                event_id=f"strategy1-oos-test-{uuid4().hex}",
+                occurred_at=captured_at,
+                git_commit=git_commit,
+            ),
+            tested_strategy_versions=((strategy.strategy_id, strategy.strategy_version),),
+            scanned_symbols=scanned_symbols,
+        )
 
     print_report_summary(report)
     print_research_gates(
@@ -1790,8 +1916,14 @@ def run_window(
         causality=causality,
         scanned_symbols=scanned_symbols,
     )
-    print(f"\nPer-run Parquet tables: {len(dataset_paths)} -> {run_dir / 'parquet_report'}")
-    print(f"Per-run Matplotlib figures: {len(visual_paths)} -> {run_dir / 'visuals'}")
+    print(
+        f"\nPer-run Parquet tables: {len(dataset_paths)} -> "
+        f"{finalized_run_dir / 'parquet_report'}"
+    )
+    print(
+        f"Per-run Matplotlib figures: {len(visual_paths)} -> "
+        f"{finalized_run_dir / 'visuals'}"
+    )
     return report
 
 
@@ -1882,29 +2014,79 @@ def main() -> None:
                 git_commit=git_commit,
                 requested_window_id=args.window_id,
             )
-        rebuild_master_json(updated_plan)
-        rebuild_master_workbook(updated_plan)
-        rebuild_master_visuals()
-        print(f"Cumulative research JSON updated: {MASTER_JSON_PATH}")
-        print(f"Master Excel updated: {MASTER_EXCEL_PATH}")
+        json_path, workbook_path = build_review_artifacts(
+            results_root=RESULTS_ROOT,
+            research_scope_id=RESEARCH_SCOPE_ID,
+            decisions=RESEARCH_DECISION_HISTORY,
+            oos_plan=updated_plan,
+            generated_at=datetime.now(IST).replace(microsecond=0),
+        )
+        print(f"Cumulative research JSON updated: {json_path}")
+        print(f"Master Excel updated: {workbook_path}")
         return
 
     strategy = LiquidityShockReclaimStrategy()
+    strategy_config_fingerprint = canonical_fingerprint(dict(strategy.parameters))
+    completed_discovery = discover_research_runs(RESULTS_ROOT)
+    model_selection = select_scope_trade_scorer(
+        model_root=MODEL_ROOT,
+        bootstrap_model_version=BOOTSTRAP_MODEL_VERSION,
+        research_scope_id=RESEARCH_SCOPE_ID,
+        plan_id=PLAN_ID,
+        strategy_id=strategy.strategy_id,
+        feature_schema=STRATEGY1_META_FEATURE_SCHEMA,
+        strategy_config_fingerprint=strategy_config_fingerprint,
+        completed_results=tuple(run.result for run in completed_discovery.completed),
+    )
+    scorer = model_selection.scorer
+    scorer_provenance: dict[str, object] = {
+        "scorer_kind": model_selection.scorer_kind,
+        "reason": model_selection.reason,
+        "artifact_fingerprint": (
+            model_selection.artifact_identity.artifact_fingerprint
+            if model_selection.artifact_identity is not None
+            else None
+        ),
+        "training_data_lineage_fingerprint": (
+            canonical_fingerprint(
+                [
+                    source.model_dump(mode="json")
+                    for source in getattr(
+                        getattr(scorer, "metadata", None), "training_sources", ()
+                    )
+                ]
+            )
+            if model_selection.scorer_kind == "TRAINED"
+            else None
+        ),
+        "evaluation_identity": (
+            model_selection.evaluation.model_dump(mode="json")
+            if model_selection.evaluation is not None
+            else None
+        ),
+    }
+    print(
+        f"ML scorer: {model_selection.scorer_kind} | {model_selection.reason}"
+    )
     store = ParquetMarketDataStore(MarketDataConfig(dataset_path=DATA_PATH))
     coverages = tuple(store.get_symbols_coverage())
-    coverage_by_symbol = {coverage.symbol: coverage for coverage in coverages}
-
     data_start, data_end = derive_equity_data_horizon(coverages)
     ready_symbol, ready_at = derive_earliest_strategy_ready(
         coverages=coverages,
         strategy=strategy,
     )
+    with OOSRegistry(OOS_REGISTRY_PATH) as preflight_registry:
+        _, development_end, _, _ = development_dates(
+            data_start=data_start,
+            data_end=data_end,
+            ready_at=ready_at,
+            registry=preflight_registry,
+        )
     causality = run_real_causality_gate(
         store=store,
-        coverage_by_symbol=coverage_by_symbol,
+        coverages=coverages,
         strategy=strategy,
-        symbol=ready_symbol,
-        ready_at=ready_at,
+        allowed_end_exclusive=development_end,
     )
 
     print(f"Equity data horizon: {data_start} -> {data_end}")
@@ -1946,6 +2128,8 @@ def main() -> None:
                 window_start=development_start,
                 window_end=development_end,
                 strategy=strategy,
+                scorer=scorer,
+                scorer_provenance=scorer_provenance,
                 store=store,
                 coverages=coverages,
                 data_start=data_start,
@@ -1974,7 +2158,7 @@ def main() -> None:
         else:
             plan = existing_plan
             if plan is None:
-                if not _run_artifacts():
+                if not discover_research_runs(RESULTS_ROOT).completed:
                     raise RuntimeError(
                         "Run the development backtest successfully before creating/testing OOS."
                     )
@@ -2007,6 +2191,8 @@ def main() -> None:
                 window_start=current.start_date,
                 window_end=current.end_date,
                 strategy=strategy,
+                scorer=scorer,
+                scorer_provenance=scorer_provenance,
                 store=store,
                 coverages=coverages,
                 data_start=data_start,
@@ -2025,14 +2211,17 @@ def main() -> None:
             )
             plan = registry.get_plan(RESEARCH_SCOPE_ID, PLAN_ID)
 
-    rebuild_master_json(plan)
-    rebuild_master_workbook(plan)
-    rebuild_master_visuals()
-
+    master_json_path, master_workbook_path = build_review_artifacts(
+        results_root=RESULTS_ROOT,
+        research_scope_id=RESEARCH_SCOPE_ID,
+        decisions=RESEARCH_DECISION_HISTORY,
+        oos_plan=plan,
+        generated_at=datetime.now(IST).replace(microsecond=0),
+    )
     print("\n=== ARTIFACT SUMMARY ===")
     print("UPLOAD ONLY THESE TWO FILES FOR REVIEW:")
-    print(f"  JSON:  {MASTER_JSON_PATH}")
-    print(f"  Excel: {MASTER_EXCEL_PATH}")
+    print(f"  JSON:  {master_json_path}")
+    print(f"  Excel: {master_workbook_path}")
     print(
         "Per-run Parquet/JSON artifacts and Matplotlib diagnostics remain internal reproducibility "
         "evidence. They do not need to be uploaded for routine research review."

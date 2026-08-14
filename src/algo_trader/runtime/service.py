@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from threading import RLock, Thread
@@ -19,8 +19,16 @@ from algo_trader.broker import (
     BrokerTradeFill,
 )
 from algo_trader.costs import calculate_round_trip_costs, get_fixed_current_backtest_cost_policy
+from algo_trader.data import bar_available_at
 from algo_trader.domain import ExitReason, Fill, Side, SignalStatus, Trade
-from algo_trader.execution import ExitResult, HistoricalExecutionSimulator
+from algo_trader.execution import (
+    ExitResult,
+    FixedBasisPointsSlippage,
+    HistoricalExecutionSimulator,
+    RMultipleTrailingCoreParameters,
+    RMultipleTrailingState,
+    advance_r_multiple_state,
+)
 from algo_trader.portfolio import (
     AllocationBatchResult,
     AllocationDecision,
@@ -34,13 +42,16 @@ from algo_trader.runtime.clock import Clock
 from algo_trader.runtime.execution import (
     LiveExecutionGateway,
     PaperExecutionGateway,
+    initialize_runtime_dynamic_exit,
     live_protective_reason,
+    runtime_exit_detail,
     update_position_excursion,
 )
 from algo_trader.runtime.identity import candidate_fingerprint, runtime_config_fingerprint
 from algo_trader.runtime.models import (
     LiveReconciliationResult,
     RuntimeConfig,
+    RuntimeDynamicExitState,
     RuntimeExitLifecycle,
     RuntimeMode,
     RuntimeOrderLeg,
@@ -109,7 +120,9 @@ class RuntimeService:
         self._stream_thread: Thread | None = None
         self._subscribed_instruments: tuple[object, ...] = ()
 
-        paper_simulator = simulator or HistoricalExecutionSimulator()
+        paper_simulator = simulator or HistoricalExecutionSimulator(
+            slippage_model=FixedBasisPointsSlippage(config.paper_slippage_bps)
+        )
         self._paper_gateway = PaperExecutionGateway(
             self.runtime_session_id, state_store, paper_simulator
         )
@@ -272,6 +285,23 @@ class RuntimeService:
             except Exception:
                 self.halt("margin/allocation batch failed without fallback", now)
                 raise
+            if self.config.mode is RuntimeMode.LIVE:
+                if self.broker is None:
+                    raise RuntimeError("LIVE broker funds safety requires a broker")
+                funds = self.broker.get_funds()
+                external_ceiling = (
+                    funds.available_limit_margin
+                    if funds.available_limit_margin is not None
+                    else funds.available_cash
+                )
+                if (
+                    external_ceiling < 0
+                    or result.ending_state.reserved_margin > external_ceiling
+                ):
+                    self.halt("broker funds ceiling would be exceeded", now)
+                    raise RuntimeError(
+                        "LIVE allocation exceeds the independent broker funds ceiling"
+                    )
             plans_by_fingerprint = {
                 candidate_fingerprint(plan.candidate): plan for plan in selected
             }
@@ -324,6 +354,84 @@ class RuntimeService:
                     self._live_positions[fingerprint] = updated
                     self.state_store.save_position(updated)
             return tuple(completed)
+
+    def advance_dynamic_exits(
+        self,
+        completed_candles: Mapping[str, pl.DataFrame],
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """Apply completed-bar trailing updates for the next bar and persist them."""
+        with self._lock:
+            now = self._at(occurred_at)
+            positions = self.positions
+            if self.config.mode is RuntimeMode.LIVE:
+                positions += tuple(
+                    position
+                    for position in self._paper_gateway.positions
+                    if position.is_shadow
+                )
+            for position in positions:
+                policy = position.dynamic_exit_policy
+                persisted = position.dynamic_exit_state
+                if policy is None or persisted is None:
+                    continue
+                symbol = position.candidate.order_intent.signal.symbol
+                candles = completed_candles.get(symbol)
+                if candles is None:
+                    raise RuntimeError(f"dynamic exit update lacks candles for {symbol}")
+                side = position.candidate.order_intent.signal.side
+                core = RMultipleTrailingState(
+                    entry_price=persisted.entry_price,
+                    initial_stop=persisted.initial_stop,
+                    risk=persisted.risk,
+                    current_stop=persisted.current_stop,
+                    best_favorable=persisted.best_favorable,
+                )
+                parameters = RMultipleTrailingCoreParameters(
+                    breakeven_trigger_r=policy.breakeven_trigger_r,
+                    breakeven_stop_r=policy.breakeven_stop_r,
+                    profit_lock_trigger_r=policy.profit_lock_trigger_r,
+                    profit_lock_stop_r=policy.profit_lock_stop_r,
+                    trailing_distance_r=policy.trailing_distance_r,
+                )
+                last_start = persisted.last_completed_bar_start
+                changed = False
+                for row in candles.iter_rows(named=True):
+                    bar_start = row["timestamp"]
+                    if bar_start < position.entry_fill.timestamp:
+                        continue
+                    if last_start is not None and bar_start <= last_start:
+                        continue
+                    if bar_available_at(bar_start) > now:
+                        continue
+                    favorable = Decimal(
+                        str(row["high"] if side is Side.LONG else row["low"])
+                    )
+                    core = advance_r_multiple_state(
+                        core, side, favorable, parameters
+                    )
+                    last_start = bar_start
+                    changed = True
+                if not changed:
+                    continue
+                updated = position.model_copy(
+                    update={
+                        "dynamic_exit_state": RuntimeDynamicExitState(
+                            entry_price=core.entry_price,
+                            initial_stop=core.initial_stop,
+                            risk=core.risk,
+                            current_stop=core.current_stop,
+                            best_favorable=core.best_favorable,
+                            hard_target=persisted.hard_target,
+                            last_completed_bar_start=last_start,
+                        )
+                    }
+                )
+                if self.config.mode is RuntimeMode.PAPER or position.is_shadow:
+                    self._paper_gateway.update_dynamic_position(updated)
+                else:
+                    self._live_positions[position.candidate_fingerprint] = updated
+                    self.state_store.save_position(updated)
 
     def request_strategy_exit(
         self,
@@ -391,13 +499,19 @@ class RuntimeService:
             self._reconcile_external_orders(now)
             self._reconcile_external_positions(now)
 
-    def check_market_data_health(self, checked_at: datetime | None = None) -> bool:
+    def check_market_data_health(
+        self,
+        checked_at: datetime | None = None,
+        *,
+        required_symbols: Sequence[str] = (),
+    ) -> bool:
         """Halt entries when required symbols have no sufficiently recent tick."""
         with self._lock:
             now = self._at(checked_at)
             required = {
                 position.candidate.order_intent.signal.symbol for position in self.positions
             }
+            required.update(required_symbols)
             required.update(
                 plan.candidate.order_intent.signal.symbol
                 for _, plan, _, _ in self.state_store.load_allocations(
@@ -846,6 +960,14 @@ class RuntimeService:
                     reservation=decision.reservation,
                     entry_fill=result.aggregate_fill,
                     protective_exit=plan.protective_exit,
+                    dynamic_exit_policy=plan.dynamic_exit_policy,
+                    dynamic_exit_state=(
+                        existing.dynamic_exit_state
+                        if existing
+                        else initialize_runtime_dynamic_exit(
+                            plan, result.aggregate_fill
+                        )
+                    ),
                     broker_entry_client_order_id=order.client_order_id,
                     mfe_return=(existing.mfe_return if existing else Decimal("0")),
                     mae_return=(existing.mae_return if existing else Decimal("0")),
@@ -933,7 +1055,11 @@ class RuntimeService:
                 )
                 self._complete_trade(
                     updated,
-                    ExitResult(fill=exit_fill, exit_reason=reason),
+                    ExitResult(
+                        fill=exit_fill,
+                        exit_reason=reason,
+                        exit_reason_detail=runtime_exit_detail(position, reason),
+                    ),
                     broker_exit_fill_ids=tuple(fill.fill_id for fill in all_fills),
                 )
 
@@ -1026,6 +1152,7 @@ class RuntimeService:
             mfe_return=position.mfe_return,
             mae_return=position.mae_return,
             exit_reason=exit_result.exit_reason,
+            exit_reason_detail=exit_result.exit_reason_detail,
             is_shadow=position.is_shadow,
         )
         entry_fill_ids = ()

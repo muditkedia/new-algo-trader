@@ -19,6 +19,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from itertools import pairwise
 from statistics import median
 from types import MappingProxyType
 from typing import Any
@@ -32,45 +33,78 @@ from algo_trader.indicators import atr
 from algo_trader.strategies.validation import validate_strategy_input
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
-_RELATIVE_VOLUME_THRESHOLD = 12.0
-_LEVEL_POLICY = "PRIOR_DAY_EXTREME_ONLY"
+@dataclass(frozen=True, slots=True)
+class LiquidityShockReclaimConfig:
+    """Single immutable source for Strategy 1 v1.1 behavior and metadata."""
 
-_PARAMETERS: Mapping[str, Any] = MappingProxyType(
-    {
-        "timeframe_minutes": 5,
-        "signal_time_start": "09:40",
-        "signal_time_end": "14:35",
-        "shock_horizon_bars": 2,
-        "shock_history_sessions": 60,
-        "shock_robust_z_threshold": 3.0,
-        "mad_consistency_scale": 1.4826,
-        "volume_history_sessions": 20,
-        "relative_volume_threshold": _RELATIVE_VOLUME_THRESHOLD,
-        "liquidity_history_sessions": 20,
-        "minimum_median_daily_turnover_rupees": 200_000_000,
-        "atr_period": 14,
-        "level_policy": _LEVEL_POLICY,
-        "minimum_penetration_atr": 0.10,
-        "maximum_penetration_atr": 0.75,
-        "minimum_reclaim_atr": 0.05,
-        "confirmation_bars": 1,
-        "stop_buffer_atr": 0.10,
-        "reward_r_multiple": 1.25,
-        "maximum_hold_minutes": 30,
-        "latest_exit_time": "15:10",
-        "trailing_breakeven_trigger_r": 0.75,
-        "trailing_breakeven_stop_r": 0.0,
-        "trailing_profit_lock_trigger_r": 1.0,
-        "trailing_profit_lock_stop_r": 0.25,
-        "trailing_distance_r": 0.50,
-        "trailing_hard_target_r": 1.25,
-        "max_signals_per_symbol_per_day": 1,
-    }
-)
+    timeframe_minutes: int = 5
+    signal_time_start: time = time(9, 40)
+    signal_time_end: time = time(14, 35)
+    shock_horizon_bars: int = 2
+    shock_history_sessions: int = 60
+    shock_robust_z_threshold: float = 3.0
+    mad_consistency_scale: float = 1.4826
+    volume_history_sessions: int = 20
+    relative_volume_threshold: float = 12.0
+    liquidity_history_sessions: int = 20
+    minimum_median_daily_turnover_rupees: int = 200_000_000
+    atr_period: int = 14
+    level_policy: str = "PRIOR_DAY_EXTREME_ONLY"
+    minimum_penetration_atr: float = 0.10
+    maximum_penetration_atr: float = 0.75
+    minimum_reclaim_atr: float = 0.05
+    confirmation_bars: int = 1
+    stop_buffer_atr: float = 0.10
+    hard_target_r: float = 1.25
+    maximum_hold_minutes: int = 30
+    latest_exit_time: time = time(15, 10)
+    trailing_breakeven_trigger_r: float = 0.75
+    trailing_breakeven_stop_r: float = 0.0
+    trailing_profit_lock_trigger_r: float = 1.0
+    trailing_profit_lock_stop_r: float = 0.25
+    trailing_distance_r: float = 0.50
+    max_signals_per_symbol_per_day: int = 1
 
-_SIGNAL_TIME_START = time(9, 40)
-_SIGNAL_TIME_END = time(14, 35)
-_BAR_DELTA = timedelta(minutes=5)
+    @property
+    def warmup_bars(self) -> int:
+        # NSE cash has 75 five-minute bars/session; 60 sessions preserves v1.1's 4500.
+        return self.shock_history_sessions * 75
+
+    def as_parameters(self) -> Mapping[str, Any]:
+        values = {
+            "timeframe_minutes": self.timeframe_minutes,
+            "signal_time_start": self.signal_time_start.strftime("%H:%M"),
+            "signal_time_end": self.signal_time_end.strftime("%H:%M"),
+            "shock_horizon_bars": self.shock_horizon_bars,
+            "shock_history_sessions": self.shock_history_sessions,
+            "shock_robust_z_threshold": self.shock_robust_z_threshold,
+            "mad_consistency_scale": self.mad_consistency_scale,
+            "volume_history_sessions": self.volume_history_sessions,
+            "relative_volume_threshold": self.relative_volume_threshold,
+            "liquidity_history_sessions": self.liquidity_history_sessions,
+            "minimum_median_daily_turnover_rupees": (
+                self.minimum_median_daily_turnover_rupees
+            ),
+            "atr_period": self.atr_period,
+            "level_policy": self.level_policy,
+            "minimum_penetration_atr": self.minimum_penetration_atr,
+            "maximum_penetration_atr": self.maximum_penetration_atr,
+            "minimum_reclaim_atr": self.minimum_reclaim_atr,
+            "confirmation_bars": self.confirmation_bars,
+            "stop_buffer_atr": self.stop_buffer_atr,
+            # Historical metadata aliases share one behavioral driver.
+            "reward_r_multiple": self.hard_target_r,
+            "maximum_hold_minutes": self.maximum_hold_minutes,
+            "latest_exit_time": self.latest_exit_time.strftime("%H:%M"),
+            "trailing_breakeven_trigger_r": self.trailing_breakeven_trigger_r,
+            "trailing_breakeven_stop_r": self.trailing_breakeven_stop_r,
+            "trailing_profit_lock_trigger_r": self.trailing_profit_lock_trigger_r,
+            "trailing_profit_lock_stop_r": self.trailing_profit_lock_stop_r,
+            "trailing_distance_r": self.trailing_distance_r,
+            "trailing_hard_target_r": self.hard_target_r,
+            "max_signals_per_symbol_per_day": self.max_signals_per_symbol_per_day,
+        }
+        return MappingProxyType(values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +149,10 @@ class LiquidityShockReclaimStrategy:
 
     strategy_id = "liquidity-shock-exhaustion-reclaim"
     strategy_version = "1.1.0"
-    parameters = _PARAMETERS
-    warmup_bars = 4500
+    def __init__(self, config: LiquidityShockReclaimConfig | None = None) -> None:
+        self.config = config or LiquidityShockReclaimConfig()
+        self.parameters = self.config.as_parameters()
+        self.warmup_bars = self.config.warmup_bars
 
     def generate_signals(self, candles: pl.DataFrame) -> list[Signal]:
         """Return cumulative signals available from completed candle history."""
@@ -125,18 +161,25 @@ class LiquidityShockReclaimStrategy:
         if len(bars) < 4:
             return []
 
-        atr_values = atr(candles, period=14).to_list()
+        config = self.config
+        atr_values = atr(candles, period=config.atr_period).to_list()
         dates, indices_by_date, slot_index, date_position = _session_index(bars)
         signals: list[Signal] = []
-        emitted_dates: set[date] = set()
+        emitted_by_date: dict[date, int] = {}
 
-        for event_index in range(2, len(bars) - 1):
+        for event_index in range(
+            config.shock_horizon_bars,
+            len(bars) - config.confirmation_bars,
+        ):
             event = bars[event_index]
-            confirmation = bars[event_index + 1]
-            if event.trading_date in emitted_dates:
-                continue  # Frozen one-signal/day gate; later setups cannot replace it.
+            confirmation = bars[event_index + config.confirmation_bars]
+            if (
+                emitted_by_date.get(event.trading_date, 0)
+                >= config.max_signals_per_symbol_per_day
+            ):
+                continue
             if not _consecutive_event_and_confirmation(
-                bars, event_index, confirmation
+                bars, event_index, confirmation, config
             ):
                 continue
             market_values = (
@@ -153,8 +196,10 @@ class LiquidityShockReclaimStrategy:
             if not all(math.isfinite(value) for value in market_values):
                 continue
 
-            signal_timestamp = bar_available_at(confirmation.timestamp, 5)
-            if not _within_signal_window(signal_timestamp):
+            signal_timestamp = bar_available_at(
+                confirmation.timestamp, config.timeframe_minutes
+            )
+            if not _within_signal_window(signal_timestamp, config):
                 continue
             event_atr = float(atr_values[event_index])
             if not _positive_finite(event_atr):
@@ -167,12 +212,13 @@ class LiquidityShockReclaimStrategy:
                 prior_dates,
                 indices_by_date,
                 slot_index,
+                config,
             )
             if normalization is None:
                 continue
-            if normalization.robust_z <= -3.0:
+            if normalization.robust_z <= -config.shock_robust_z_threshold:
                 side = Side.LONG
-            elif normalization.robust_z >= 3.0:
+            elif normalization.robust_z >= config.shock_robust_z_threshold:
                 side = Side.SHORT
             else:
                 continue
@@ -184,6 +230,7 @@ class LiquidityShockReclaimStrategy:
                 event_atr,
                 prior_dates,
                 indices_by_date,
+                config,
             )
             if qualifying is None:
                 continue
@@ -192,9 +239,9 @@ class LiquidityShockReclaimStrategy:
                 continue
 
             stop_reference = (
-                event.low - 0.10 * event_atr
+                event.low - config.stop_buffer_atr * event_atr
                 if side is Side.LONG
-                else event.high + 0.10 * event_atr
+                else event.high + config.stop_buffer_atr * event_atr
             )
             feature_snapshot = _feature_snapshot(
                 event,
@@ -205,6 +252,7 @@ class LiquidityShockReclaimStrategy:
                 penetration,
                 reclaim_depth,
                 stop_reference,
+                config,
             )
             signals.append(
                 Signal(
@@ -217,7 +265,9 @@ class LiquidityShockReclaimStrategy:
                     feature_snapshot=feature_snapshot,
                 )
             )
-            emitted_dates.add(event.trading_date)
+            emitted_by_date[event.trading_date] = (
+                emitted_by_date.get(event.trading_date, 0) + 1
+            )
 
         return signals
 
@@ -263,18 +313,20 @@ def _session_index(
 
 
 def _consecutive_event_and_confirmation(
-    bars: tuple[_Bar, ...], event_index: int, confirmation: _Bar
+    bars: tuple[_Bar, ...],
+    event_index: int,
+    confirmation: _Bar,
+    config: LiquidityShockReclaimConfig,
 ) -> bool:
     event = bars[event_index]
-    return (
-        bars[event_index - 2].trading_date == event.trading_date
-        and bars[event_index - 1].trading_date == event.trading_date
-        and bars[event_index - 1].timestamp - bars[event_index - 2].timestamp
-        == _BAR_DELTA
-        and event.timestamp - bars[event_index - 1].timestamp == _BAR_DELTA
-        and confirmation.trading_date == event.trading_date
-        and confirmation.timestamp - event.timestamp == _BAR_DELTA
-    )
+    first_index = event_index - config.shock_horizon_bars
+    last_index = event_index + config.confirmation_bars
+    sequence = bars[first_index : last_index + 1]
+    delta = timedelta(minutes=config.timeframe_minutes)
+    return all(item.trading_date == event.trading_date for item in sequence) and all(
+        current.timestamp - previous.timestamp == delta
+        for previous, current in pairwise(sequence)
+    ) and confirmation is sequence[-1]
 
 
 def _normalization(
@@ -283,9 +335,10 @@ def _normalization(
     prior_dates: list[date],
     indices_by_date: dict[date, list[int]],
     slot_index: dict[tuple[date, time], int],
+    config: LiquidityShockReclaimConfig,
 ) -> _Normalization | None:
     event = bars[event_index]
-    shock_return = _shock_return(bars, event_index)
+    shock_return = _shock_return(bars, event_index, config)
     if shock_return is None:
         return None
 
@@ -295,23 +348,29 @@ def _normalization(
     for prior_date in reversed(prior_dates):
         equivalent_index = slot_index.get((prior_date, event.slot))
         if equivalent_index is not None:
-            if len(shock_history) < 60:
-                historical_return = _shock_return(bars, equivalent_index)
+            if len(shock_history) < config.shock_history_sessions:
+                historical_return = _shock_return(bars, equivalent_index, config)
                 if historical_return is not None:
                     shock_history.append(historical_return)
-            if len(volume_history) < 20:
+            if len(volume_history) < config.volume_history_sessions:
                 historical_volume = bars[equivalent_index].volume
                 if _positive_finite(historical_volume):
                     volume_history.append(historical_volume)
-        if len(shock_history) == 60 and len(volume_history) == 20:
+        if (
+            len(shock_history) == config.shock_history_sessions
+            and len(volume_history) == config.volume_history_sessions
+        ):
             break
-    if len(shock_history) != 60 or len(volume_history) != 20:
+    if (
+        len(shock_history) != config.shock_history_sessions
+        or len(volume_history) != config.volume_history_sessions
+    ):
         return None
 
     shock_median = float(median(shock_history))
     shock_mad = float(median(abs(value - shock_median) for value in shock_history))
     # 1.4826 makes MAD comparable to standard deviation under a normal baseline.
-    scale = 1.4826 * shock_mad
+    scale = config.mad_consistency_scale * shock_mad
     if not _positive_finite(scale):
         return None
     robust_z = (shock_return - shock_median) / scale
@@ -320,11 +379,11 @@ def _normalization(
         return None
     relative_volume = event.volume / volume_median
 
-    if len(prior_dates) < 20:
+    if len(prior_dates) < config.liquidity_history_sessions:
         return None
     turnovers = [
         _daily_turnover(bars, indices_by_date[prior_date])
-        for prior_date in prior_dates[-20:]
+        for prior_date in prior_dates[-config.liquidity_history_sessions :]
     ]
     if any(value is None for value in turnovers):
         return None
@@ -340,22 +399,31 @@ def _normalization(
     )
     if not all(math.isfinite(value) for value in values):
         return None
-    if relative_volume < _RELATIVE_VOLUME_THRESHOLD or median_turnover < 200_000_000:
+    if (
+        relative_volume < config.relative_volume_threshold
+        or median_turnover < config.minimum_median_daily_turnover_rupees
+    ):
         return None
     return _Normalization(*values)
 
 
-def _shock_return(bars: tuple[_Bar, ...], index: int) -> float | None:
-    if index < 2:
+def _shock_return(
+    bars: tuple[_Bar, ...],
+    index: int,
+    config: LiquidityShockReclaimConfig,
+) -> float | None:
+    if index < config.shock_horizon_bars:
         return None
-    start = bars[index - 2]
-    middle = bars[index - 1]
+    start = bars[index - config.shock_horizon_bars]
     end = bars[index]
+    window = bars[index - config.shock_horizon_bars : index + 1]
+    delta = timedelta(minutes=config.timeframe_minutes)
     if (
-        start.trading_date != end.trading_date
-        or middle.trading_date != end.trading_date
-        or middle.timestamp - start.timestamp != _BAR_DELTA
-        or end.timestamp - middle.timestamp != _BAR_DELTA
+        any(item.trading_date != end.trading_date for item in window)
+        or any(
+            current.timestamp - previous.timestamp != delta
+            for previous, current in pairwise(window)
+        )
         or not _positive_finite(start.close)
         or not math.isfinite(end.close)
     ):
@@ -378,9 +446,10 @@ def _qualifying_level(
     event_atr: float,
     prior_dates: list[date],
     indices_by_date: dict[date, list[int]],
+    config: LiquidityShockReclaimConfig,
 ) -> tuple[_Level, float, float] | None:
     event = bars[event_index]
-    levels = _candidate_levels(bars, side, prior_dates, indices_by_date)
+    levels = _candidate_levels(bars, side, prior_dates, indices_by_date, config)
     for level in levels:
         penetration = (
             level.price - event.low
@@ -393,9 +462,9 @@ def _qualifying_level(
             else level.price - event.close
         )
         if (
-            _at_least(penetration, 0.10 * event_atr)
-            and _at_most(penetration, 0.75 * event_atr)
-            and _at_least(reclaim, 0.05 * event_atr)
+            _at_least(penetration, config.minimum_penetration_atr * event_atr)
+            and _at_most(penetration, config.maximum_penetration_atr * event_atr)
+            and _at_least(reclaim, config.minimum_reclaim_atr * event_atr)
         ):
             return level, penetration, reclaim
     return None
@@ -406,6 +475,7 @@ def _candidate_levels(
     side: Side,
     prior_dates: list[date],
     indices_by_date: dict[date, list[int]],
+    config: LiquidityShockReclaimConfig,
 ) -> tuple[_Level, ...]:
     """Return the single previous-day extreme eligible in v1.1.
 
@@ -413,6 +483,8 @@ def _candidate_levels(
     but are intentionally excluded from v1.1. The previous-day extreme is known
     before the current session opens, preserving the original causal contract.
     """
+    if config.level_policy != "PRIOR_DAY_EXTREME_ONLY":
+        raise ValueError(f"unsupported level_policy: {config.level_policy}")
     if not prior_dates:
         return ()
 
@@ -429,7 +501,10 @@ def _candidate_levels(
         _Level(
             price=price,
             level_type="PDL" if side is Side.LONG else "PDH",
-            known_at=bar_available_at(bars[prior_indices[-1]].timestamp, 5),
+            known_at=bar_available_at(
+                bars[prior_indices[-1]].timestamp,
+                config.timeframe_minutes,
+            ),
         ),
     )
 
@@ -442,9 +517,12 @@ def _confirmation_passes(
     return confirmation.high <= level and confirmation.close < event.close
 
 
-def _within_signal_window(timestamp: datetime) -> bool:
+def _within_signal_window(
+    timestamp: datetime,
+    config: LiquidityShockReclaimConfig,
+) -> bool:
     local_time = timestamp.astimezone(MARKET_TIMEZONE).time().replace(tzinfo=None)
-    return _SIGNAL_TIME_START <= local_time <= _SIGNAL_TIME_END
+    return config.signal_time_start <= local_time <= config.signal_time_end
 
 
 def _feature_snapshot(
@@ -456,6 +534,7 @@ def _feature_snapshot(
     penetration: float,
     reclaim_depth: float,
     stop_reference: float,
+    config: LiquidityShockReclaimConfig,
 ) -> dict[str, Any]:
     # R metadata is stored instead of moving a stop before an actual fill exists.
     values: dict[str, Any] = {
@@ -487,15 +566,15 @@ def _feature_snapshot(
         "confirmation_close": confirmation.close,
         "confirmation_return_from_event_close": confirmation.close / event.close - 1.0,
         "stop_reference_price": stop_reference,
-        "stop_buffer_atr": 0.10,
-        "reward_r_multiple": 1.25,
-        "maximum_hold_minutes": 30,
-        "trailing_breakeven_trigger_r": 0.75,
-        "trailing_breakeven_stop_r": 0.0,
-        "trailing_profit_lock_trigger_r": 1.0,
-        "trailing_profit_lock_stop_r": 0.25,
-        "trailing_distance_r": 0.50,
-        "trailing_hard_target_r": 1.25,
+        "stop_buffer_atr": config.stop_buffer_atr,
+        "reward_r_multiple": config.hard_target_r,
+        "maximum_hold_minutes": config.maximum_hold_minutes,
+        "trailing_breakeven_trigger_r": config.trailing_breakeven_trigger_r,
+        "trailing_breakeven_stop_r": config.trailing_breakeven_stop_r,
+        "trailing_profit_lock_trigger_r": config.trailing_profit_lock_trigger_r,
+        "trailing_profit_lock_stop_r": config.trailing_profit_lock_stop_r,
+        "trailing_distance_r": config.trailing_distance_r,
+        "trailing_hard_target_r": config.hard_target_r,
     }
     numeric = [value for value in values.values() if isinstance(value, int | float)]
     if not all(math.isfinite(value) for value in numeric):

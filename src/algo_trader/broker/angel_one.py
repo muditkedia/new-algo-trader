@@ -345,6 +345,10 @@ class AngelOneBroker:
             utilised_exposure=_optional_decimal(data.get("utilisedexposure")),
         )
 
+    def authenticated_client(self) -> object:
+        """Return the authenticated SDK boundary for broker-owned provider adapters."""
+        return self._require_sdk()
+
     def get_ltp(self, symbol: str, observed_at: datetime) -> BrokerQuote:
         """Request one exact NSE LTP and normalize monetary fields to Decimal."""
         _require_aware(observed_at, "observed_at")

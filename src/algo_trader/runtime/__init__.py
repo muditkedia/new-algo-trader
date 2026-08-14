@@ -1,7 +1,16 @@
 """Deterministic intraday Runtime orchestration and safety boundary."""
 
-from algo_trader.runtime.calendar import ExplicitTradingDayCalendar, TradingDayProvider
+from algo_trader.runtime.calendar import (
+    ExplicitTradingDayCalendar,
+    TradingDayProvider,
+    load_trading_day_calendar,
+)
 from algo_trader.runtime.clock import Clock, SystemClock
+from algo_trader.runtime.composition import (
+    FiveMinuteStrategyCycle,
+    RuntimeApplication,
+    compose_runtime_application,
+)
 from algo_trader.runtime.connectivity import run_smartapi_connectivity_check
 from algo_trader.runtime.credentials import (
     DEFAULT_SMARTAPI_ENV_PATH,
@@ -29,6 +38,8 @@ from algo_trader.runtime.models import (
     LiveReconciliationResult,
     RuntimeConfig,
     RuntimeConnectivityReport,
+    RuntimeDynamicExitPolicy,
+    RuntimeDynamicExitState,
     RuntimeEvent,
     RuntimeExitLifecycle,
     RuntimeMode,
@@ -43,6 +54,7 @@ from algo_trader.runtime.models import (
     RuntimeTradePlan,
     RuntimeTradeRecord,
 )
+from algo_trader.runtime.plans import ScoredStrategyPlanProvider
 from algo_trader.runtime.protocols import RuntimeExecutionGateway, RuntimePlanProvider
 from algo_trader.runtime.scheduler import RuntimeScheduler
 from algo_trader.runtime.service import RuntimeService
@@ -54,12 +66,16 @@ __all__ = [
     "RUNTIME_ARCHITECTURE_VERSION",
     "Clock",
     "ExplicitTradingDayCalendar",
+    "FiveMinuteStrategyCycle",
     "LiveExecutionGateway",
     "LiveReconciliationResult",
     "PaperExecutionGateway",
     "PaperTickResult",
     "RuntimeConfig",
+    "RuntimeApplication",
     "RuntimeConnectivityReport",
+    "RuntimeDynamicExitPolicy",
+    "RuntimeDynamicExitState",
     "RuntimeEvent",
     "RuntimeExecutionGateway",
     "RuntimeExitLifecycle",
@@ -71,6 +87,7 @@ __all__ = [
     "RuntimePlanProvider",
     "RuntimePositionRecord",
     "RuntimeScheduler",
+    "ScoredStrategyPlanProvider",
     "RuntimeService",
     "RuntimeSessionRecord",
     "RuntimeSessionTimes",
@@ -86,9 +103,11 @@ __all__ = [
     "get_completed_five_minute_candles",
     "live_protective_reason",
     "load_smartapi_credentials",
+    "load_trading_day_calendar",
     "point_bar_from_tick",
     "run_smartapi_connectivity_check",
     "runtime_client_order_id",
     "runtime_config_fingerprint",
     "update_position_excursion",
+    "compose_runtime_application",
 ]

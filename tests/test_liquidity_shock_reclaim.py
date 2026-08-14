@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
@@ -9,8 +10,9 @@ import pytest
 
 import algo_trader.strategies.liquidity_shock_reclaim as strategy_module
 from algo_trader import Side, SignalStatus
-from algo_trader.data import bar_available_at
+from algo_trader.data import SymbolCoverage, bar_available_at
 from algo_trader.strategies import (
+    LiquidityShockReclaimConfig,
     LiquidityShockReclaimStrategy,
     Strategy,
     assert_strategy_prefix_invariant,
@@ -261,6 +263,42 @@ def test_identity_protocol_and_exact_immutable_parameters() -> None:
     assert isinstance(strategy.parameters, MappingProxyType)
     with pytest.raises(TypeError):
         strategy.parameters["atr_period"] = 99  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"shock_robust_z_threshold": 1_000_000_000.0},
+        {"relative_volume_threshold": 100.0},
+        {"minimum_median_daily_turnover_rupees": 10_000_000_000},
+        {"minimum_penetration_atr": 10.0},
+        {"minimum_reclaim_atr": 10.0},
+        {"signal_time_end": time(10, 0)},
+    ],
+    ids=("shock-z", "rvol", "turnover", "penetration", "reclaim", "signal-window"),
+)
+def test_optimizer_eligible_config_changes_real_eligibility(
+    updates: dict[str, object],
+) -> None:
+    baseline = LiquidityShockReclaimStrategy().generate_signals(make_fixture())
+    configured = LiquidityShockReclaimStrategy(
+        replace(LiquidityShockReclaimConfig(), **updates)
+    ).generate_signals(make_fixture())
+    assert len(baseline) == 1
+    assert configured == []
+
+
+def test_exit_config_changes_behavioral_signal_metadata_from_same_source() -> None:
+    config = replace(
+        LiquidityShockReclaimConfig(),
+        stop_buffer_atr=0.2,
+        hard_target_r=1.4,
+    )
+    signal = LiquidityShockReclaimStrategy(config).generate_signals(make_fixture())[0]
+    assert signal.feature_snapshot["stop_buffer_atr"] == 0.2
+    assert signal.feature_snapshot["trailing_hard_target_r"] == 1.4
+    assert signal.strategy_parameters["reward_r_multiple"] == 1.4
+    assert signal.strategy_parameters["trailing_hard_target_r"] == 1.4
 
 
 @pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
@@ -571,3 +609,46 @@ def test_representative_fixture_passes_exhaustive_prefix_causality_gate() -> Non
     assert report.full_signal_count == 1
     assert report.first_tested_prefix_length == 4500
     assert report.tested_prefix_count == 2
+
+
+def test_runner_real_causality_preflight_is_non_vacuous() -> None:
+    from scripts.run_strategy1_development_backtest import run_real_causality_gate
+
+    candles = make_fixture()
+    last = candles.row(-1, named=True)
+    future = []
+    for offset in range(1, 9):
+        timestamp = last["timestamp"] + timedelta(minutes=5 * offset)
+        future.append(
+            {
+                **last,
+                "timestamp": timestamp,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 30_000.0,
+            }
+        )
+    extended = pl.concat((candles, pl.DataFrame(future, schema=candles.schema)))
+
+    class Store:
+        def load_candles(self, symbol, start, end):
+            assert symbol == "TEST"
+            return extended.clone()
+
+    report = run_real_causality_gate(
+        store=Store(),  # type: ignore[arg-type]
+        coverages=(
+            SymbolCoverage(
+                symbol="TEST",
+                first_timestamp=extended["timestamp"].item(0),
+                last_timestamp=extended["timestamp"].item(-1),
+                row_count=extended.height,
+            ),
+        ),
+        strategy=LiquidityShockReclaimStrategy(),
+        allowed_end_exclusive=extended["timestamp"].item(-1).date() + timedelta(days=1),
+    )
+    assert report.full_signal_count >= 1
+    assert report.tested_prefix_count > 2

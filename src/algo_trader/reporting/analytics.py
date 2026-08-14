@@ -203,6 +203,7 @@ def _verify_oos(
     result: BacktestRunResult,
     record: OOSTestRecord | None,
     fingerprint: str,
+    context: ReportContext,
 ) -> dict[str, str | None]:
     empty = {
         "research_scope_id": None,
@@ -211,7 +212,20 @@ def _verify_oos(
         "oos_result_fingerprint": None,
     }
     if record is None:
-        return empty
+        if context.oos_result_fingerprint is None:
+            return empty
+        if context.oos_result_fingerprint != fingerprint:
+            raise ReportingIntegrityError(
+                "pre-registration OOS result fingerprint does not match backtest result"
+            )
+        return {
+            "research_scope_id": context.research_scope_id,
+            "plan_id": context.plan_id,
+            "window_id": context.window_id,
+            "oos_result_fingerprint": context.oos_result_fingerprint,
+        }
+    if context.oos_result_fingerprint is not None:
+        raise ValueError("OOS provenance must come from either context or record, not both")
     if not isinstance(record, OOSTestRecord):
         raise TypeError("oos_test_record must be an OOSTestRecord or None")
     comparisons = {
@@ -504,7 +518,7 @@ def build_report(
     """Build deterministic validated analytics without mutating source records."""
     actual, shadow = _validate_result(result, context)
     fingerprint = fingerprint_backtest_result(result)
-    oos_values = _verify_oos(result, oos_test_record, fingerprint)
+    oos_values = _verify_oos(result, oos_test_record, fingerprint, context)
     actual_costs = _cost_summary(actual, "ACTUAL")
     shadow_costs = _cost_summary(shadow, "SHADOW / HYPOTHETICAL - NO ACTUAL CAPITAL IMPACT")
     equity = _equity_curve(actual, result)

@@ -50,6 +50,19 @@ class ExitReason(StrEnum):
     STRATEGY_EXIT = "STRATEGY_EXIT"
 
 
+class ExitReasonDetail(StrEnum):
+    """Optional analytical classification preserving the historical reason enum."""
+
+    INITIAL_STOP = "INITIAL_STOP"
+    BREAKEVEN_STOP = "BREAKEVEN_STOP"
+    PROFIT_LOCK = "PROFIT_LOCK"
+    TRAILING_STOP = "TRAILING_STOP"
+    HARD_TARGET = "HARD_TARGET"
+    TIME = "TIME"
+    STRATEGY = "STRATEGY"
+    MANUAL = "MANUAL"
+
+
 class OrderType(StrEnum):
     """Broker-neutral order styles required by an execution adapter."""
 
@@ -204,6 +217,7 @@ class Trade(DomainModel):
     mfe_return: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
     mae_return: Annotated[Decimal, Field(le=0, allow_inf_nan=False)]
     exit_reason: ExitReason
+    exit_reason_detail: ExitReasonDetail | None = None
     is_shadow: bool = False
 
     @property

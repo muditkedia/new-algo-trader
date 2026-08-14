@@ -67,4 +67,7 @@ That strategy's tests must explicitly call `assert_strategy_prefix_invariant(...
 deterministic representative fixture or history slice that exceeds warmup, spans enough
 prefixes, includes a session boundary where relevant, and exercises its major branches. The
 architecture-level harness passing its own adversarial tests does not certify any future
-strategy. There are currently no production strategies certified by this gate.
+strategy. Strategy 1's research runner additionally locates a real signal in development or
+explicitly `TRAINING_ALLOWED` history, includes post-signal rows, and fails closed unless the
+existing gate compares a nontrivial number of prefixes with at least one signal. This is
+research causality evidence, not a claim of profitability or production certification.

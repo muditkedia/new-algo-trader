@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from algo_trader import (
     ExitReason,
+    ExitReasonDetail,
     MLScore,
     OrderIntent,
     OrderType,
@@ -569,6 +570,7 @@ def test_r_multiple_trailing_is_next_bar_causal_and_monotonic(
         Decimal("107.5")
     }
     assert trade.exit_reason is ExitReason.STOP_LOSS
+    assert trade.exit_reason_detail is ExitReasonDetail.PROFIT_LOCK
     assert trade.exit_fill.price == Decimal("101.25")
     assert trade.exit_fill.timestamp == at(*day, 9, 35)
 
@@ -601,6 +603,10 @@ def test_r_multiple_above_profit_trigger_uses_distance_behind_best(
 
     assert simulator.active_levels[1].stop_price == Decimal("103.5")
     assert result.actual_trade_records[0].trade.exit_fill.price == Decimal("103.5")
+    assert (
+        result.actual_trade_records[0].trade.exit_reason_detail
+        is ExitReasonDetail.TRAILING_STOP
+    )
 
 
 @pytest.mark.parametrize(
@@ -661,6 +667,11 @@ def test_r_multiple_effective_deadline_caps_and_exact_open_exit(
     assert trade.exit_fill.timestamp == deadline
     assert trade.exit_fill.price == Decimal("102.0")
     assert trade.exit_reason is reason
+    assert trade.exit_reason_detail is (
+        ExitReasonDetail.STRATEGY
+        if reason is ExitReason.STRATEGY_EXIT
+        else ExitReasonDetail.TIME
+    )
 
 
 def test_r_multiple_max_hold_starts_at_actual_intrabar_limit_fill(

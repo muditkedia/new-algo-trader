@@ -108,6 +108,11 @@ def _trade_rows(
                 "mfe_return": trade.mfe_return,
                 "mae_return": trade.mae_return,
                 "exit_reason": trade.exit_reason.value,
+                "exit_reason_detail": (
+                    trade.exit_reason_detail.value
+                    if trade.exit_reason_detail is not None
+                    else None
+                ),
                 "ml_model_version": trade.ml_score.model_version,
                 "ml_quality_score": trade.ml_score.quality_score,
                 "ml_calibrated_probability": trade.ml_score.calibrated_probability,
@@ -150,6 +155,7 @@ TRADE_SCHEMA = {
     "mfe_return": DECIMAL,
     "mae_return": DECIMAL,
     "exit_reason": pl.String,
+    "exit_reason_detail": pl.String,
     "ml_model_version": pl.String,
     "ml_quality_score": pl.Float64,
     "ml_calibrated_probability": pl.Float64,

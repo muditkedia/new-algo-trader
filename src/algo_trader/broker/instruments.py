@@ -18,7 +18,11 @@ ANGEL_ONE_INSTRUMENT_MASTER_URL = (
 class AngelOneInstrumentMaster:
     """Deterministic exact NSE cash-equity index."""
 
-    def __init__(self, instruments: Sequence[BrokerInstrument]) -> None:
+    def __init__(
+        self,
+        instruments: Sequence[BrokerInstrument],
+        aliases: Mapping[str, str] | None = None,
+    ) -> None:
         selected = tuple(sorted(instruments, key=lambda item: (item.symbol, item.symbol_token)))
         if not selected:
             raise BrokerInstrumentError("instrument master contains no NSE EQ instruments")
@@ -30,15 +34,43 @@ class AngelOneInstrumentMaster:
         self._instruments = selected
         self._by_symbol = {key: tuple(value) for key, value in by_symbol.items()}
         self._by_token = {key: tuple(value) for key, value in by_token.items()}
+        selected_aliases = dict(aliases or {})
+        if any(
+            not isinstance(source, str)
+            or not source.strip()
+            or not isinstance(target, str)
+            or not target.strip()
+            for source, target in selected_aliases.items()
+        ):
+            raise BrokerInstrumentError("instrument aliases must map nonblank symbols")
+        if any(source in self._by_symbol for source in selected_aliases):
+            raise BrokerInstrumentError("instrument alias cannot replace an exact current symbol")
+        missing_targets = sorted(set(selected_aliases.values()) - set(self._by_symbol))
+        if missing_targets:
+            raise BrokerInstrumentError(
+                "instrument alias targets are absent from the current master: "
+                + ", ".join(missing_targets)
+            )
+        self._aliases = selected_aliases
 
     @property
     def instruments(self) -> tuple[BrokerInstrument, ...]:
         """Return the deterministic immutable instrument ordering."""
         return self._instruments
 
+    @property
+    def aliases(self) -> Mapping[str, str]:
+        """Return a detached auditable historical-to-current symbol mapping."""
+        return dict(self._aliases)
+
+    def with_aliases(self, aliases: Mapping[str, str]) -> AngelOneInstrumentMaster:
+        """Create a new immutable resolver with explicit caller-verified aliases."""
+        return AngelOneInstrumentMaster(self._instruments, aliases)
+
     def resolve(self, symbol: str) -> BrokerInstrument:
         """Resolve one exact internal symbol to exactly one NSE ``-EQ`` record."""
-        matches = self._by_symbol.get(symbol, ())
+        resolved_symbol = self._aliases.get(symbol, symbol)
+        matches = self._by_symbol.get(resolved_symbol, ())
         if not matches:
             raise BrokerInstrumentError(f"no exact NSE EQ instrument for symbol: {symbol}")
         if len(matches) != 1:

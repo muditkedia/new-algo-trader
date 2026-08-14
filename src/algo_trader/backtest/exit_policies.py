@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -15,8 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from algo_trader.backtest.models import BacktestIntegrityError, DynamicExitPolicySpec
 from algo_trader.data import bar_available_at
-from algo_trader.domain import ExitReason, Fill, ProtectiveExitSpec, Side
+from algo_trader.domain import ExitReason, ExitReasonDetail, Fill, ProtectiveExitSpec, Side
 from algo_trader.execution import ExitResult, HistoricalExecutionSimulator
+from algo_trader.execution.dynamic_exit import (
+    RMultipleTrailingCoreParameters,
+    advance_r_multiple_state,
+    initialize_r_multiple_state,
+    r_multiple_stop_detail,
+)
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
@@ -148,20 +154,17 @@ class RMultipleTrailingExitPolicyResolver:
         parameters = _RMultipleTrailingParameters.model_validate(dict(spec.parameters))
         entry_price = entry_fill.price
         initial_stop = parameters.initial_stop_price
-        risk = (
-            entry_price - initial_stop
-            if side is Side.LONG
-            else initial_stop - entry_price
-        )
-        if not risk.is_finite() or risk <= 0:
+        try:
+            state = initialize_r_multiple_state(side, entry_price, initial_stop)
+        except ValueError as error:
             raise BacktestIntegrityError(
                 "R_MULTIPLE_TRAILING_V1 requires strictly positive initial risk "
                 f"from actual entry fill for {symbol!r}"
-            )
+            ) from error
         target = (
-            entry_price + parameters.hard_target_r * risk
+            entry_price + parameters.hard_target_r * state.risk
             if side is Side.LONG
-            else entry_price - parameters.hard_target_r * risk
+            else entry_price - parameters.hard_target_r * state.risk
         )
         if not target.is_finite() or target <= 0:
             raise BacktestIntegrityError(
@@ -200,7 +203,6 @@ class RMultipleTrailingExitPolicyResolver:
             parameters=parameters,
             initial_stop=initial_stop,
             target=target,
-            risk=risk,
             deadline=deadline,
             deadline_reason=deadline_reason,
         )
@@ -217,13 +219,18 @@ class RMultipleTrailingExitPolicyResolver:
         parameters: _RMultipleTrailingParameters,
         initial_stop: Decimal,
         target: Decimal,
-        risk: Decimal,
         deadline: datetime,
         deadline_reason: ExitReason,
     ) -> ExitResult:
         eligible = candles.filter(pl.col("timestamp") >= entry_fill.timestamp)
-        current_stop = initial_stop
-        best_favorable = entry_fill.price
+        state = initialize_r_multiple_state(side, entry_fill.price, initial_stop)
+        core_parameters = RMultipleTrailingCoreParameters(
+            breakeven_trigger_r=parameters.breakeven_trigger_r,
+            breakeven_stop_r=parameters.breakeven_stop_r,
+            profit_lock_trigger_r=parameters.profit_lock_trigger_r,
+            profit_lock_stop_r=parameters.profit_lock_stop_r,
+            trailing_distance_r=parameters.trailing_distance_r,
+        )
 
         for index, row in enumerate(eligible.iter_rows(named=True)):
             bar_start = row["timestamp"]
@@ -242,7 +249,12 @@ class RMultipleTrailingExitPolicyResolver:
                     candles=bar_frame,
                 )
                 if result is not None and result.fill.timestamp == deadline:
-                    return result
+                    detail = (
+                        ExitReasonDetail.STRATEGY
+                        if deadline_reason is ExitReason.STRATEGY_EXIT
+                        else ExitReasonDetail.TIME
+                    )
+                    return replace(result, exit_reason_detail=detail)
                 break
 
             bar_end = bar_available_at(
@@ -256,75 +268,35 @@ class RMultipleTrailingExitPolicyResolver:
                 quantity=quantity,
                 active_from=bar_start,
                 protective_exit=ProtectiveExitSpec(
-                    stop_price=current_stop,
+                    stop_price=state.current_stop,
                     target_price=target,
                 ),
                 candles=bar_frame,
             )
             if protective is not None:
-                return protective
+                detail = (
+                    ExitReasonDetail.HARD_TARGET
+                    if protective.exit_reason is ExitReason.TARGET_REACHED
+                    else r_multiple_stop_detail(state, side, core_parameters)
+                )
+                return replace(protective, exit_reason_detail=detail)
 
             favorable = Decimal(str(row["high"] if side is Side.LONG else row["low"]))
             if not favorable.is_finite() or favorable <= 0:
                 raise BacktestIntegrityError(
                     "R_MULTIPLE_TRAILING_V1 requires finite positive candle prices"
                 )
-            best_favorable = (
-                max(best_favorable, favorable)
-                if side is Side.LONG
-                else min(best_favorable, favorable)
-            )
-            mfe_r = (
-                (best_favorable - entry_fill.price) / risk
-                if side is Side.LONG
-                else (entry_fill.price - best_favorable) / risk
-            )
-            current_stop = _next_stop(
-                side=side,
-                entry_price=entry_fill.price,
-                current_stop=current_stop,
-                best_favorable=best_favorable,
-                mfe_r=mfe_r,
-                risk=risk,
-                parameters=parameters,
+            state = advance_r_multiple_state(
+                state,
+                side,
+                favorable,
+                core_parameters,
             )
 
         raise BacktestIntegrityError(
             "R_MULTIPLE_TRAILING_V1 could not exit exactly at its mandatory "
             f"deadline {deadline.isoformat()} for {symbol!r}"
         )
-
-
-def _next_stop(
-    *,
-    side: Side,
-    entry_price: Decimal,
-    current_stop: Decimal,
-    best_favorable: Decimal,
-    mfe_r: Decimal,
-    risk: Decimal,
-    parameters: _RMultipleTrailingParameters,
-) -> Decimal:
-    if mfe_r < parameters.breakeven_trigger_r:
-        return current_stop
-    if side is Side.LONG:
-        breakeven = entry_price + parameters.breakeven_stop_r * risk
-        profit_lock = entry_price + parameters.profit_lock_stop_r * risk
-        if mfe_r < parameters.profit_lock_trigger_r:
-            return max(current_stop, breakeven)
-        if mfe_r == parameters.profit_lock_trigger_r:
-            return max(current_stop, profit_lock)
-        trailing = best_favorable - parameters.trailing_distance_r * risk
-        return max(current_stop, profit_lock, trailing)
-
-    breakeven = entry_price - parameters.breakeven_stop_r * risk
-    profit_lock = entry_price - parameters.profit_lock_stop_r * risk
-    if mfe_r < parameters.profit_lock_trigger_r:
-        return min(current_stop, breakeven)
-    if mfe_r == parameters.profit_lock_trigger_r:
-        return min(current_stop, profit_lock)
-    trailing = best_favorable + parameters.trailing_distance_r * risk
-    return min(current_stop, profit_lock, trailing)
 
 
 def _require_aware(value: object, name: str) -> None:

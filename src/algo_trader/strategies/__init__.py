@@ -8,12 +8,14 @@ from algo_trader.strategies.causality import (
 )
 from algo_trader.strategies.contract import Strategy
 from algo_trader.strategies.liquidity_shock_reclaim import (
+    LiquidityShockReclaimConfig,
     LiquidityShockReclaimStrategy,
 )
 from algo_trader.strategies.validation import validate_strategy_input
 
 __all__ = [
     "STRATEGY_CAUSALITY_GATE_VERSION",
+    "LiquidityShockReclaimConfig",
     "LiquidityShockReclaimStrategy",
     "Strategy",
     "StrategyCausalityReport",

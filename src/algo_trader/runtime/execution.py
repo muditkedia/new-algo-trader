@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -23,12 +23,26 @@ from algo_trader.broker import (
     entry_action,
     exit_action,
 )
-from algo_trader.domain import ExitReason, Fill, OrderType, Side
+from algo_trader.domain import (
+    ExitReason,
+    ExitReasonDetail,
+    Fill,
+    OrderType,
+    ProtectiveExitSpec,
+    Side,
+)
 from algo_trader.execution import ExitResult, HistoricalExecutionSimulator
+from algo_trader.execution.dynamic_exit import (
+    RMultipleTrailingCoreParameters,
+    RMultipleTrailingState,
+    initialize_r_multiple_state,
+    r_multiple_stop_detail,
+)
 from algo_trader.portfolio import AllocationDecision, AllocationOutcome
 from algo_trader.runtime.identity import candidate_fingerprint, runtime_client_order_id
 from algo_trader.runtime.models import (
     LiveReconciliationResult,
+    RuntimeDynamicExitState,
     RuntimeExitLifecycle,
     RuntimeOrderLeg,
     RuntimeOrderLifecycle,
@@ -118,6 +132,10 @@ class PaperExecutionGateway:
                 reservation=None if pending.is_shadow else pending.decision.reservation,
                 entry_fill=fill,
                 protective_exit=pending.plan.protective_exit,
+                dynamic_exit_policy=pending.plan.dynamic_exit_policy,
+                dynamic_exit_state=initialize_runtime_dynamic_exit(
+                    pending.plan, fill
+                ),
                 is_shadow=pending.is_shadow,
             )
             self._positions[fingerprint] = position
@@ -215,6 +233,13 @@ class PaperExecutionGateway:
             raise ValueError("position belongs to another runtime session")
         self._positions[position.candidate_fingerprint] = position
 
+    def update_dynamic_position(self, position: RuntimePositionRecord) -> None:
+        """Replace and persist one already-open PAPER/shadow dynamic state."""
+        if position.candidate_fingerprint not in self._positions:
+            raise LookupError("dynamic position update requires an open PAPER position")
+        self._positions[position.candidate_fingerprint] = position
+        self.state_store.save_position(position)
+
     def _add_pending(
         self,
         plan: RuntimeTradePlan,
@@ -249,15 +274,22 @@ class PaperExecutionGateway:
                 exit_reason=position.requested_exit_reason,
                 candles=point_bar,
             )
-        if position.protective_exit is None:
+        protective_exit = effective_runtime_protective_exit(position)
+        if protective_exit is None:
             return None
-        return self.simulator.fill_protective_exit(
+        result = self.simulator.fill_protective_exit(
             side=signal.side,
             symbol=signal.symbol,
             quantity=position.entry_fill.quantity,
             entry_fill=position.entry_fill,
-            protective_exit=position.protective_exit,
+            protective_exit=protective_exit,
             candles=point_bar,
+        )
+        if result is None or position.dynamic_exit_state is None:
+            return result
+        return replace(
+            result,
+            exit_reason_detail=runtime_exit_detail(position, result.exit_reason),
         )
 
 
@@ -623,7 +655,7 @@ def live_protective_reason(
     tick: BrokerMarketTick,
 ) -> ExitReason | None:
     """Return the threshold proven by one observed live LTP, if any."""
-    protective = position.protective_exit
+    protective = effective_runtime_protective_exit(position)
     if (
         protective is None
         or tick.instrument.symbol != position.candidate.order_intent.signal.symbol
@@ -642,6 +674,74 @@ def live_protective_reason(
         if protective.target_price is not None and price <= protective.target_price:
             return ExitReason.TARGET_REACHED
     return None
+
+
+def initialize_runtime_dynamic_exit(
+    plan: RuntimeTradePlan,
+    entry_fill: Fill,
+) -> RuntimeDynamicExitState | None:
+    policy = plan.dynamic_exit_policy
+    if policy is None:
+        return None
+    side = plan.candidate.order_intent.signal.side
+    core = initialize_r_multiple_state(side, entry_fill.price, policy.initial_stop_price)
+    target = (
+        entry_fill.price + policy.hard_target_r * core.risk
+        if side is Side.LONG
+        else entry_fill.price - policy.hard_target_r * core.risk
+    )
+    if target <= 0:
+        raise ValueError("runtime dynamic exit produced a nonpositive hard target")
+    return RuntimeDynamicExitState(
+        entry_price=core.entry_price,
+        initial_stop=core.initial_stop,
+        risk=core.risk,
+        current_stop=core.current_stop,
+        best_favorable=core.best_favorable,
+        hard_target=target,
+    )
+
+
+def effective_runtime_protective_exit(
+    position: RuntimePositionRecord,
+) -> ProtectiveExitSpec | None:
+    if position.dynamic_exit_state is None:
+        return position.protective_exit
+    return ProtectiveExitSpec(
+        stop_price=position.dynamic_exit_state.current_stop,
+        target_price=position.dynamic_exit_state.hard_target,
+    )
+
+
+def runtime_exit_detail(
+    position: RuntimePositionRecord,
+    reason: ExitReason,
+) -> ExitReasonDetail | None:
+    state = position.dynamic_exit_state
+    policy = position.dynamic_exit_policy
+    if state is None or policy is None:
+        return None
+    if reason is ExitReason.TARGET_REACHED:
+        return ExitReasonDetail.HARD_TARGET
+    if reason is not ExitReason.STOP_LOSS:
+        return None
+    return r_multiple_stop_detail(
+        RMultipleTrailingState(
+            entry_price=state.entry_price,
+            initial_stop=state.initial_stop,
+            risk=state.risk,
+            current_stop=state.current_stop,
+            best_favorable=state.best_favorable,
+        ),
+        position.candidate.order_intent.signal.side,
+        RMultipleTrailingCoreParameters(
+            breakeven_trigger_r=policy.breakeven_trigger_r,
+            breakeven_stop_r=policy.breakeven_stop_r,
+            profit_lock_trigger_r=policy.profit_lock_trigger_r,
+            profit_lock_stop_r=policy.profit_lock_stop_r,
+            trailing_distance_r=policy.trailing_distance_r,
+        ),
+    )
 
 
 def update_position_excursion(

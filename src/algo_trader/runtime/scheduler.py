@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from algo_trader.runtime.calendar import TradingDayProvider
 from algo_trader.runtime.models import RuntimeSessionTimes
@@ -50,14 +51,20 @@ class RuntimeScheduler:
         trading_date: date,
         session_times: RuntimeSessionTimes,
         runtime_session_id: str,
+        strategy_cycle: Callable[[], object] | None = None,
     ) -> tuple[str, ...]:
-        """Create exactly four deterministic non-overlapping jobs for a trading date."""
+        """Create deterministic lifecycle jobs and an optional five-minute cycle."""
         if not self.trading_calendar.is_trading_day(trading_date):
             return ()
         callbacks = (
             ("market-open", session_times.market_open_time, self.service.market_open),
             ("entry-cutoff", session_times.entry_cutoff_time, self.service.close_entries),
             ("square-off", session_times.square_off_time, self.service.force_square_off),
+            (
+                "market-close-check",
+                session_times.market_close_time,
+                self.service.market_close_check,
+            ),
             ("shutdown", session_times.shutdown_time, self._scheduled_shutdown),
         )
         job_ids = []
@@ -67,6 +74,23 @@ class RuntimeScheduler:
             self._scheduler.add_job(
                 callback,
                 trigger=DateTrigger(run_date=run_date, timezone=MARKET_TIMEZONE),
+                id=job_id,
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=self._misfire_grace_seconds,
+            )
+            job_ids.append(job_id)
+        if strategy_cycle is not None:
+            job_id = f"runtime:{runtime_session_id}:{trading_date.isoformat()}:strategy-cycle"
+            self._scheduler.add_job(
+                strategy_cycle,
+                trigger=IntervalTrigger(
+                    minutes=5,
+                    start_date=_at(trading_date, time(9, 20)),
+                    end_date=_at(trading_date, session_times.entry_cutoff_time),
+                    timezone=MARKET_TIMEZONE,
+                ),
                 id=job_id,
                 replace_existing=True,
                 max_instances=1,

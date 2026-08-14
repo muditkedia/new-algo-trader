@@ -11,6 +11,7 @@ import polars as pl
 from algo_trader.data import CANONICAL_CANDLE_COLUMNS, bar_available_at
 from algo_trader.domain import (
     ExitReason,
+    ExitReasonDetail,
     Fill,
     OrderIntent,
     OrderType,
@@ -30,6 +31,7 @@ class ExitResult:
 
     fill: Fill
     exit_reason: ExitReason
+    exit_reason_detail: ExitReasonDetail | None = None
 
 
 class HistoricalExecutionSimulator:

@@ -336,6 +336,7 @@ def test_authentication_uses_caller_time_totp_refreshes_immutably_and_logs_out()
     assert sdk.calls[0] == ("generateSession", ("CLIENT1", "1234", expected_totp))
     assert authenticated.authenticated_at == occurred_at
     assert authenticated.jwt_token.get_secret_value() == "jwt-secret"
+    assert broker.authenticated_client() is sdk
 
     refreshed = broker.refresh_session(authenticated, at(10))
     assert refreshed is not authenticated
@@ -375,6 +376,11 @@ def test_instrument_parser_selects_only_exact_nse_eq_deterministically() -> None
     assert len(first.instruments) == 1
     with pytest.raises(BrokerInstrumentError, match="no exact"):
         first.resolve("UNKNOWN")
+    aliased = first.with_aliases({"RELIANCE-OLD": "RELIANCE"})
+    assert aliased.resolve("RELIANCE-OLD") == instrument
+    assert aliased.aliases == {"RELIANCE-OLD": "RELIANCE"}
+    with pytest.raises(BrokerInstrumentError, match="targets"):
+        first.with_aliases({"OLD": "MISSING"})
 
 
 def test_instrument_parser_rejects_ambiguous_and_malformed_exact_records() -> None:
@@ -857,7 +863,7 @@ def test_margin_snapshot_capture_fails_fast_on_first_systemic_failure(
         def authenticate(self, credentials, captured_at):
             return object()
 
-        def _require_sdk(self):
+        def authenticated_client(self):
             return object()
 
         def get_ltp(self, symbol, captured_at):

@@ -512,6 +512,27 @@ def test_oos_provenance_is_verified_without_mutation() -> None:
         build_report(result, context(), record.model_copy(update={"result_fingerprint": "wrong"}))
 
 
+def test_oos_provenance_can_be_bound_before_registry_mutation() -> None:
+    result = make_result()
+    fingerprint = fingerprint_backtest_result(result)
+    pre_registration = context().model_copy(
+        update={
+            "research_scope_id": "scope",
+            "plan_id": "plan",
+            "window_id": "window",
+            "oos_result_fingerprint": fingerprint,
+        }
+    )
+    report = build_report(result, pre_registration)
+    assert report.provenance.research_scope_id == "scope"
+    assert report.provenance.oos_result_fingerprint == fingerprint
+    with pytest.raises(ReportingIntegrityError, match="pre-registration"):
+        build_report(
+            result,
+            pre_registration.model_copy(update={"oos_result_fingerprint": "wrong"}),
+        )
+
+
 def test_polars_tables_and_parquet_dataset_are_canonical_and_non_overwriting(
     tmp_path: Path,
 ) -> None:

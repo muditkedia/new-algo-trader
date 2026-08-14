@@ -15,11 +15,14 @@ without changing the frozen lower-layer trading semantics.
 | Runtime-2 | RESOLVED | Stream shutdown is bounded, audited, fail-closed, and protected by an explicitly managed daemon-thread fail-safe. |
 | Community-1 | ARCHITECTURE RESOLVED / EXTERNAL REVIEW REQUIRED BEFORE EXTERNAL DISTRIBUTION | SmartAPI retains its vendor-license classification and an enforced redistribution-review prerequisite. |
 
-Remaining architecture defects: **NONE**.
+The listed hardening findings are resolved. Integration readiness remains governed by
+the research-artifact, ML-lifecycle, causality-preflight, and Runtime composition checks;
+this document does not claim that no future architecture defects can remain.
 
 The SmartAPI redistribution review is an external legal/commercial prerequisite
 before external distribution or productization. It is not a software architecture
 defect and this document does not provide legal advice.
 
-This status is not an Architecture Freeze declaration. The separate Causality Gate
-has not been passed or claimed by this implementation pass.
+This status is not an Architecture Freeze declaration. Strategy 1 now has a tested
+real-signal causality preflight, but each strategy/configuration and research run must
+retain its own causality and provenance evidence.
