@@ -17,6 +17,9 @@ from pydantic import (
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 StrictDate = Annotated[date, Field(strict=True)]
+StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
+_STANDARD_PARTITION_POLICY_ID = "EARLIEST_START_3M_MAX_V1"
+_STANDARD_SEALED_HOLDOUT_MONTHS = 12
 
 
 class FrozenOOSModel(BaseModel):
@@ -82,12 +85,55 @@ class OOSDateRange(FrozenOOSModel):
         return self
 
 
+class OOSPartitionPolicy(FrozenOOSModel):
+    """Versioned rules for standard OOS partition and universe construction."""
+
+    policy_id: NonEmptyStr
+    target_window_months: StrictPositiveInt
+    minimum_window_months: StrictPositiveInt
+    maximum_window_months: StrictPositiveInt
+    sealed_holdout_months: StrictPositiveInt
+    horizon_policy_id: NonEmptyStr
+    universe_policy_id: NonEmptyStr
+    excluded_reference_symbols: tuple[str, ...]
+
+    @field_validator("excluded_reference_symbols", mode="before")
+    @classmethod
+    def normalize_excluded_reference_symbols(cls, value: object) -> tuple[str, ...]:
+        return _normalize_unique_strings(
+            value,
+            "excluded_reference_symbols",
+            allow_empty=True,
+        )
+
+    @model_validator(mode="after")
+    def validate_window_bounds(self) -> OOSPartitionPolicy:
+        if not (
+            self.minimum_window_months
+            <= self.target_window_months
+            <= self.maximum_window_months
+        ):
+            raise ValueError(
+                "window months must satisfy minimum_window_months <= "
+                "target_window_months <= maximum_window_months"
+            )
+        if (
+            self.policy_id == _STANDARD_PARTITION_POLICY_ID
+            and self.sealed_holdout_months != _STANDARD_SEALED_HOLDOUT_MONTHS
+        ):
+            raise ValueError(
+                "EARLIEST_START_3M_MAX_V1 requires a 12-calendar-month sealed holdout"
+            )
+        return self
+
+
 class OOSPlan(FrozenOOSModel):
     """One research-lineage plan over a fixed historical data horizon."""
 
     research_scope_id: NonEmptyStr
     plan_id: NonEmptyStr
     protocol_version: NonEmptyStr
+    partition_policy: OOSPartitionPolicy | None = None
     strategy_ids: tuple[str, ...]
     data_start_date: StrictDate
     data_end_exclusive: StrictDate
@@ -110,12 +156,20 @@ class OOSPlan(FrozenOOSModel):
 
         if self.data_start_date >= self.data_end_exclusive:
             raise ValueError("data_start_date must be earlier than data_end_exclusive")
+        holdout_months = (
+            self.partition_policy.sealed_holdout_months
+            if self.partition_policy is not None
+            else _STANDARD_SEALED_HOLDOUT_MONTHS
+        )
         expected_holdout_start = shift_calendar_months(
             self.data_end_exclusive,
-            -12,
+            -holdout_months,
         )
         if self.sealed_holdout_start_date != expected_holdout_start:
-            raise ValueError("sealed holdout must start exactly 12 calendar months before data end")
+            raise ValueError(
+                "sealed holdout must start exactly "
+                f"{holdout_months} calendar months before data end"
+            )
         if self.sealed_holdout_end_exclusive != self.data_end_exclusive:
             raise ValueError("sealed holdout must end at data_end_exclusive")
         if self.data_start_date >= self.sealed_holdout_start_date:
@@ -150,6 +204,21 @@ class OOSPlan(FrozenOOSModel):
                 <= self.sealed_holdout_start_date
             ):
                 raise ValueError("ordinary OOS window is outside the pre-holdout data range")
+            if self.partition_policy is not None and not (
+                window.end_date
+                >= shift_calendar_months(
+                    window.start_date,
+                    self.partition_policy.minimum_window_months,
+                )
+                and window.end_date
+                <= shift_calendar_months(
+                    window.start_date,
+                    self.partition_policy.maximum_window_months,
+                )
+            ):
+                raise ValueError(
+                    "policy-bound ordinary OOS window is outside duration bounds"
+                )
             previous_end = window.end_date
         if previous_end != self.sealed_holdout_start_date:
             raise ValueError("final ordinary OOS must end exactly at sealed holdout start")
@@ -183,6 +252,7 @@ class OOSTestRecord(FrozenOOSModel):
     ml_model_versions: tuple[str, ...]
     result_fingerprint: NonEmptyStr
     registration_audit: OOSAuditContext
+    scanned_symbols: tuple[str, ...] | None = None
 
     @field_validator("scope_strategy_ids", mode="before")
     @classmethod
@@ -195,6 +265,13 @@ class OOSTestRecord(FrozenOOSModel):
         cls, value: object
     ) -> tuple[tuple[str, str], ...]:
         return normalize_strategy_versions(value)
+
+    @field_validator("scanned_symbols", mode="before")
+    @classmethod
+    def normalize_scanned_symbols(cls, value: object) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        return _normalize_unique_strings(value, "scanned_symbols")
 
     @model_validator(mode="after")
     def validate_strategy_lineage(self) -> OOSTestRecord:
@@ -214,6 +291,13 @@ class OOSTestRecord(FrozenOOSModel):
             raise ValueError(
                 "non-empty strategy_versions must exactly equal tested_strategy_versions"
             )
+        if self.scanned_symbols is not None:
+            outside_scan = sorted(set(self.symbols) - set(self.scanned_symbols))
+            if outside_scan:
+                raise ValueError(
+                    "result symbols must be contained in scanned_symbols: "
+                    + ", ".join(outside_scan)
+                )
         return self
 
 
@@ -256,14 +340,19 @@ def normalize_strategy_versions(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(normalized))
 
 
-def _normalize_unique_strings(value: object, name: str) -> tuple[str, ...]:
+def _normalize_unique_strings(
+    value: object,
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     if isinstance(value, str) or value is None:
         raise ValueError(f"{name} must be a non-empty iterable")
     try:
         selected = tuple(value)  # type: ignore[arg-type]
     except TypeError as error:
         raise TypeError(f"{name} must be iterable") from error
-    if not selected:
+    if not selected and not allow_empty:
         raise ValueError(f"{name} must contain at least one value")
     normalized = []
     for item in selected:
@@ -273,3 +362,15 @@ def _normalize_unique_strings(value: object, name: str) -> tuple[str, ...]:
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{name} must not contain duplicates")
     return tuple(sorted(normalized))
+
+
+STANDARD_OOS_PARTITION_POLICY = OOSPartitionPolicy(
+    policy_id=_STANDARD_PARTITION_POLICY_ID,
+    target_window_months=3,
+    minimum_window_months=1,
+    maximum_window_months=3,
+    sealed_holdout_months=_STANDARD_SEALED_HOLDOUT_MONTHS,
+    horizon_policy_id="EARLIEST_AVAILABLE_EQUITY_DATA_V1",
+    universe_policy_id="ALL_HISTORICALLY_AVAILABLE_EQUITIES_V1",
+    excluded_reference_symbols=("BANKNIFTY", "INDIAVIX", "NIFTY50"),
+)

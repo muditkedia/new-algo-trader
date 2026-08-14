@@ -8,17 +8,24 @@ from pydantic import ValidationError
 
 from algo_trader.backtest import BacktestRunResult
 from algo_trader.costs import BrokeragePlan
+from algo_trader.data import SymbolCoverage
 from algo_trader.oos import (
     DEFAULT_OOS_PROTOCOL_VERSION,
     SEALED_HOLDOUT_WINDOW_ID,
+    STANDARD_OOS_PARTITION_POLICY,
     OOSAuditContext,
+    OOSPartitionPolicy,
     OOSPlan,
     OOSRegistry,
     OOSTestRecord,
     OOSWindowSpec,
     OOSWindowState,
+    build_standard_oos_windows,
     create_oos_plan,
+    create_standard_oos_plan,
+    derive_equity_data_horizon,
     fingerprint_backtest_result,
+    select_historically_available_equities,
     shift_calendar_months,
 )
 
@@ -130,11 +137,365 @@ def test_calendar_month_shift_clamps_deterministically(
     assert shift_calendar_months(source, months) == expected
 
 
+def test_standard_partition_policy_is_exact_normalized_and_immutable() -> None:
+    policy = STANDARD_OOS_PARTITION_POLICY
+
+    assert policy == OOSPartitionPolicy(
+        policy_id="EARLIEST_START_3M_MAX_V1",
+        target_window_months=3,
+        minimum_window_months=1,
+        maximum_window_months=3,
+        sealed_holdout_months=12,
+        horizon_policy_id="EARLIEST_AVAILABLE_EQUITY_DATA_V1",
+        universe_policy_id="ALL_HISTORICALLY_AVAILABLE_EQUITIES_V1",
+        excluded_reference_symbols=("NIFTY50", "BANKNIFTY", "INDIAVIX"),
+    )
+    assert policy.excluded_reference_symbols == (
+        "BANKNIFTY",
+        "INDIAVIX",
+        "NIFTY50",
+    )
+    with pytest.raises(ValidationError):
+        policy.target_window_months = 2
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"target_window_months": True},
+        {"minimum_window_months": 4},
+        {"maximum_window_months": 2},
+        {"sealed_holdout_months": 11},
+        {"excluded_reference_symbols": ("NIFTY50", " NIFTY50 ")},
+        {"excluded_reference_symbols": ("",)},
+        {"unexpected": "forbidden"},
+    ],
+)
+def test_standard_partition_policy_rejects_invalid_values(
+    updates: dict[str, object],
+) -> None:
+    values = STANDARD_OOS_PARTITION_POLICY.model_dump() | updates
+    with pytest.raises(ValidationError):
+        OOSPartitionPolicy(**values)
+
+
+@pytest.mark.parametrize(
+    ("end_date", "expected_ranges"),
+    [
+        (
+            date(2024, 10, 1),
+            (
+                (date(2024, 1, 1), date(2024, 4, 1)),
+                (date(2024, 4, 1), date(2024, 7, 1)),
+                (date(2024, 7, 1), date(2024, 10, 1)),
+            ),
+        ),
+        (
+            date(2024, 11, 1),
+            (
+                (date(2024, 1, 1), date(2024, 4, 1)),
+                (date(2024, 4, 1), date(2024, 7, 1)),
+                (date(2024, 7, 1), date(2024, 10, 1)),
+                (date(2024, 10, 1), date(2024, 11, 1)),
+            ),
+        ),
+        (
+            date(2024, 12, 1),
+            (
+                (date(2024, 1, 1), date(2024, 4, 1)),
+                (date(2024, 4, 1), date(2024, 7, 1)),
+                (date(2024, 7, 1), date(2024, 10, 1)),
+                (date(2024, 10, 1), date(2024, 12, 1)),
+            ),
+        ),
+        (
+            date(2024, 10, 15),
+            (
+                (date(2024, 1, 1), date(2024, 4, 1)),
+                (date(2024, 4, 1), date(2024, 7, 1)),
+                (date(2024, 7, 1), date(2024, 9, 1)),
+                (date(2024, 9, 1), date(2024, 10, 15)),
+            ),
+        ),
+        (
+            date(2024, 3, 15),
+            ((date(2024, 1, 1), date(2024, 3, 15)),),
+        ),
+    ],
+)
+def test_standard_window_generation_is_exact_and_deterministic(
+    end_date: date,
+    expected_ranges: tuple[tuple[date, date], ...],
+) -> None:
+    first = build_standard_oos_windows(
+        earliest_oos_start_date=date(2024, 1, 1),
+        sealed_holdout_start_date=end_date,
+    )
+    second = build_standard_oos_windows(
+        earliest_oos_start_date=date(2024, 1, 1),
+        sealed_holdout_start_date=end_date,
+    )
+
+    assert first == second
+    assert tuple((window.start_date, window.end_date) for window in first) == (
+        expected_ranges
+    )
+    assert tuple(window.window_id for window in first) == tuple(
+        f"oos-{ordinal:03d}" for ordinal in range(1, len(first) + 1)
+    )
+    assert first[0].start_date == date(2024, 1, 1)
+    assert first[-1].end_date == end_date
+    assert all(
+        window.end_date
+        >= shift_calendar_months(
+            window.start_date,
+            STANDARD_OOS_PARTITION_POLICY.minimum_window_months,
+        )
+        and window.end_date
+        <= shift_calendar_months(
+            window.start_date,
+            STANDARD_OOS_PARTITION_POLICY.maximum_window_months,
+        )
+        for window in first
+    )
+    assert all(
+        left.end_date == right.start_date
+        for left, right in zip(first, first[1:], strict=False)
+    )
+
+
+def test_standard_window_generation_honors_month_end_clamping() -> None:
+    windows = build_standard_oos_windows(
+        earliest_oos_start_date=date(2024, 1, 31),
+        sealed_holdout_start_date=date(2024, 8, 30),
+    )
+
+    assert tuple((window.start_date, window.end_date) for window in windows) == (
+        (date(2024, 1, 31), date(2024, 4, 30)),
+        (date(2024, 4, 30), date(2024, 7, 30)),
+        (date(2024, 7, 30), date(2024, 8, 30)),
+    )
+
+
+def test_standard_window_generation_rejects_less_than_one_calendar_month() -> None:
+    with pytest.raises(ValueError, match="at least one minimum window"):
+        build_standard_oos_windows(
+            earliest_oos_start_date=date(2024, 1, 15),
+            sealed_holdout_start_date=date(2024, 2, 14),
+        )
+
+
+def test_strategy_lineage_can_create_standard_plan() -> None:
+    plan = create_standard_oos_plan(
+        research_scope_id="liquidity-shock-exhaustion-reclaim",
+        plan_id="synthetic-plan",
+        strategy_ids=("liquidity-shock-exhaustion-reclaim",),
+        data_start_date=date(2021, 1, 1),
+        data_end_exclusive=date(2026, 1, 1),
+        earliest_oos_start_date=date(2023, 2, 1),
+        audit_context=audit("standard-plan"),
+    )
+
+    assert plan.development_start_date == date(2021, 1, 1)
+    assert plan.development_end_exclusive == date(2023, 2, 1)
+    assert plan.oos_windows[0].start_date == date(2023, 2, 1)
+    assert plan.oos_windows[-1].end_date == date(2025, 1, 1)
+    assert all(window.state is OOSWindowState.AVAILABLE for window in plan.oos_windows)
+    assert plan.sealed_holdout_start_date == date(2025, 1, 1)
+    assert plan.sealed_holdout.state is OOSWindowState.SEALED_HOLDOUT
+    assert plan.partition_policy == STANDARD_OOS_PARTITION_POLICY
+
+
+@pytest.mark.parametrize(
+    "earliest_oos_start",
+    [date(2023, 1, 1), date(2025, 1, 1), date(2025, 2, 1)],
+)
+def test_standard_plan_rejects_invalid_earliest_oos_start(
+    earliest_oos_start: date,
+) -> None:
+    with pytest.raises(ValueError, match="earliest_oos_start_date"):
+        create_standard_oos_plan(
+            research_scope_id="scope",
+            plan_id="plan",
+            strategy_ids=("strategy",),
+            data_start_date=date(2023, 1, 1),
+            data_end_exclusive=date(2026, 1, 1),
+            earliest_oos_start_date=earliest_oos_start,
+            audit_context=audit("invalid-standard-plan"),
+        )
+
+
+def coverage(
+    symbol: str,
+    first: datetime | None,
+    last: datetime | None,
+    row_count: int = 1,
+) -> SymbolCoverage:
+    return SymbolCoverage(
+        symbol=symbol,
+        first_timestamp=first,
+        last_timestamp=last,
+        row_count=row_count,
+    )
+
+
+def test_equity_horizon_uses_all_equities_but_not_reference_series() -> None:
+    utc = ZoneInfo("UTC")
+    coverages = (
+        coverage(
+            "LATE",
+            datetime(2021, 6, 1, tzinfo=MARKET_TIMEZONE),
+            datetime(2024, 12, 31, tzinfo=MARKET_TIMEZONE),
+        ),
+        coverage(
+            "EARLY",
+            datetime(2020, 1, 1, 20, tzinfo=utc),
+            datetime(2023, 1, 1, tzinfo=utc),
+        ),
+        coverage(
+            "NIFTY50",
+            datetime(1990, 1, 1, tzinfo=utc),
+            datetime(2030, 1, 1, tzinfo=utc),
+        ),
+    )
+
+    expected = (date(2020, 1, 2), date(2025, 1, 1))
+    assert derive_equity_data_horizon(coverages) == expected
+    assert derive_equity_data_horizon(reversed(coverages)) == expected
+
+
+def test_equity_horizon_rejects_no_equity_coverage() -> None:
+    with pytest.raises(ValueError, match="no non-reference equity coverage"):
+        derive_equity_data_horizon(
+            (
+                coverage(
+                    "BANKNIFTY",
+                    datetime(2020, 1, 1, tzinfo=MARKET_TIMEZONE),
+                    datetime(2024, 1, 1, tzinfo=MARKET_TIMEZONE),
+                ),
+                coverage("EMPTY", None, None, row_count=0),
+            )
+        )
+
+
+def test_historical_universe_is_overlap_based_sorted_and_reference_free() -> None:
+    coverages = (
+        coverage(
+            "DELISTED",
+            datetime(2022, 1, 1, tzinfo=MARKET_TIMEZONE),
+            datetime(2024, 2, 1, tzinfo=MARKET_TIMEZONE),
+        ),
+        coverage(
+            "LATER_LISTED",
+            datetime(2024, 3, 15, tzinfo=MARKET_TIMEZONE),
+            datetime(2026, 1, 1, tzinfo=MARKET_TIMEZONE),
+        ),
+        coverage(
+            "NO_OVERLAP",
+            datetime(2024, 7, 1, tzinfo=MARKET_TIMEZONE),
+            datetime(2026, 1, 1, tzinfo=MARKET_TIMEZONE),
+        ),
+        coverage(
+            "NIFTY50",
+            datetime(2020, 1, 1, tzinfo=MARKET_TIMEZONE),
+            datetime(2026, 1, 1, tzinfo=MARKET_TIMEZONE),
+        ),
+        coverage(
+            "ONE_ROW",
+            datetime(2024, 5, 1, tzinfo=MARKET_TIMEZONE),
+            datetime(2024, 5, 1, tzinfo=MARKET_TIMEZONE),
+        ),
+    )
+
+    selected = select_historically_available_equities(
+        reversed(coverages),
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 7, 1),
+    )
+
+    assert selected == ("DELISTED", "LATER_LISTED", "ONE_ROW")
+
+
+def make_standard_plan_for_registry() -> OOSPlan:
+    return create_standard_oos_plan(
+        research_scope_id="scope-a",
+        plan_id="standard-plan",
+        strategy_ids=("strategy",),
+        data_start_date=date(2023, 1, 1),
+        data_end_exclusive=date(2026, 1, 1),
+        earliest_oos_start_date=date(2024, 1, 1),
+        audit_context=audit("create-standard-registry"),
+    )
+
+
+def test_registry_round_trips_standard_policy_and_scanned_universe(
+    tmp_path: Path,
+) -> None:
+    plan = make_standard_plan_for_registry()
+    first_window = plan.oos_windows[0]
+    result = make_result(first_window.start_date, first_window.end_date)
+    with OOSRegistry(tmp_path / "standard.duckdb") as registry:
+        persisted_plan = registry.create_plan(plan)
+        record = registry.register_test_result(
+            "scope-a",
+            "standard-plan",
+            first_window.window_id,
+            result,
+            audit("standard-result", 1),
+            result.strategy_versions,
+            scanned_symbols=("ZERO_SIGNAL", "BBB", "AAA"),
+        )
+
+        assert persisted_plan.partition_policy == STANDARD_OOS_PARTITION_POLICY
+        assert record.scanned_symbols == ("AAA", "BBB", "ZERO_SIGNAL")
+        assert registry.get_test_record(
+            "scope-a",
+            "standard-plan",
+            first_window.window_id,
+        ) == record
+        assert registry.get_plan("scope-a", "standard-plan").oos_windows[
+            0
+        ].state is OOSWindowState.TESTED
+
+
+@pytest.mark.parametrize(
+    ("scanned_symbols", "message"),
+    [
+        (None, "requires scanned_symbols"),
+        (("AAA", "BBB", "NIFTY50"), "exclude reference"),
+        (("AAA",), "contained in scanned_symbols"),
+    ],
+)
+def test_standard_registration_rejects_invalid_scan_attestation(
+    tmp_path: Path,
+    scanned_symbols: tuple[str, ...] | None,
+    message: str,
+) -> None:
+    plan = make_standard_plan_for_registry()
+    first_window = plan.oos_windows[0]
+    with OOSRegistry(tmp_path / f"invalid-{message[:5]}.duckdb") as registry:
+        registry.create_plan(plan)
+        with pytest.raises(ValueError, match=message):
+            registry.register_test_result(
+                "scope-a",
+                "standard-plan",
+                first_window.window_id,
+                make_result(first_window.start_date, first_window.end_date),
+                audit(f"invalid-{message}", 1),
+                (("strategy", "1"),),
+                scanned_symbols=scanned_symbols,
+            )
+        assert registry.next_testable_window(
+            "scope-a",
+            "standard-plan",
+        ) == first_window
+
+
 def test_plan_has_exact_final_twelve_calendar_month_holdout() -> None:
     plan = make_plan()
 
-    assert DEFAULT_OOS_PROTOCOL_VERSION == "2"
-    assert plan.protocol_version == "2"
+    assert DEFAULT_OOS_PROTOCOL_VERSION == "3"
+    assert plan.protocol_version == "3"
     assert plan.sealed_holdout_start_date == date(2025, 1, 1)
     assert plan.sealed_holdout_end_exclusive == date(2026, 1, 1)
     assert plan.sealed_holdout.state is OOSWindowState.SEALED_HOLDOUT

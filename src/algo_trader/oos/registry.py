@@ -16,6 +16,7 @@ from algo_trader.oos.fingerprint import fingerprint_backtest_result
 from algo_trader.oos.models import (
     OOSAuditContext,
     OOSDateRange,
+    OOSPartitionPolicy,
     OOSPlan,
     OOSTestRecord,
     OOSTransitionRecord,
@@ -101,7 +102,13 @@ class OOSRegistry:
             audit = plan.creation_audit
             self._connection.execute(
                 """
-                INSERT INTO oos_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO oos_plans (
+                    research_scope_id, plan_id, protocol_version, data_start_date,
+                    data_end_exclusive, development_start_date,
+                    development_end_exclusive, sealed_holdout_start_date,
+                    sealed_holdout_end_exclusive, creation_event_id,
+                    creation_occurred_at, creation_git_commit, partition_policy_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     plan.research_scope_id,
@@ -116,6 +123,11 @@ class OOSRegistry:
                     audit.event_id,
                     audit.occurred_at.isoformat(),
                     audit.git_commit,
+                    (
+                        _canonical_json(plan.partition_policy.model_dump(mode="json"))
+                        if plan.partition_policy is not None
+                        else None
+                    ),
                 ],
             )
             if not existing_binding:
@@ -200,6 +212,11 @@ class OOSRegistry:
             research_scope_id=row[0],
             plan_id=row[1],
             protocol_version=row[2],
+            partition_policy=(
+                OOSPartitionPolicy.model_validate_json(row[12])
+                if row[12] is not None
+                else None
+            ),
             strategy_ids=tuple(item[0] for item in binding_rows),
             data_start_date=row[3],
             data_end_exclusive=row[4],
@@ -238,6 +255,7 @@ class OOSRegistry:
         result: BacktestRunResult,
         audit_context: OOSAuditContext,
         tested_strategy_versions: object,
+        scanned_symbols: object | None = None,
     ) -> OOSTestRecord:
         """Register exactly one complete result for the current testable window."""
         if not isinstance(result, BacktestRunResult):
@@ -246,6 +264,10 @@ class OOSRegistry:
             raise TypeError("audit_context must be an OOSAuditContext")
         attestation = normalize_strategy_versions(tested_strategy_versions)
         plan = self.get_plan(research_scope_id, plan_id)
+        if plan.partition_policy is not None and scanned_symbols is None:
+            raise ValueError(
+                "standard-policy result registration requires scanned_symbols"
+            )
         outside_scope = sorted(
             {strategy_id for strategy_id, _ in attestation} - set(plan.strategy_ids)
         )
@@ -308,7 +330,19 @@ class OOSRegistry:
             ml_model_versions=result.ml_model_versions,
             result_fingerprint=fingerprint_backtest_result(result),
             registration_audit=audit_context,
+            scanned_symbols=scanned_symbols,
         )
+        if plan.partition_policy is not None:
+            assert record.scanned_symbols is not None
+            forbidden = sorted(
+                set(record.scanned_symbols)
+                & set(plan.partition_policy.excluded_reference_symbols)
+            )
+            if forbidden:
+                raise ValueError(
+                    "scanned_symbols must exclude reference symbols: "
+                    + ", ".join(forbidden)
+                )
         with self._transaction():
             self._assert_event_id_available(audit_context.event_id)
             duplicate_run = self._connection.execute(
@@ -345,8 +379,8 @@ class OOSRegistry:
                     strategy_versions_json, ml_model_versions_json, result_fingerprint,
                     registration_event_id, registration_occurred_at,
                     registration_git_commit, scope_strategy_ids_json,
-                    tested_strategy_versions_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tested_strategy_versions_json, scanned_symbols_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     record.research_scope_id,
@@ -368,6 +402,11 @@ class OOSRegistry:
                     audit_context.git_commit,
                     _canonical_json(record.scope_strategy_ids),
                     _canonical_json(record.tested_strategy_versions),
+                    (
+                        _canonical_json(record.scanned_symbols)
+                        if record.scanned_symbols is not None
+                        else None
+                    ),
                 ],
             )
             self._set_window_state(
@@ -534,6 +573,9 @@ class OOSRegistry:
             scope_strategy_ids=tuple(json.loads(row[17])),
             tested_strategy_versions=tuple(
                 tuple(item) for item in json.loads(row[18])
+            ),
+            scanned_symbols=(
+                tuple(json.loads(row[19])) if row[19] is not None else None
             ),
         )
 
@@ -738,6 +780,10 @@ class OOSRegistry:
             """
         )
         self._connection.execute(
+            "ALTER TABLE oos_plans ADD COLUMN IF NOT EXISTS "
+            "partition_policy_json VARCHAR"
+        )
+        self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS oos_research_scope_strategies (
                 research_scope_id VARCHAR NOT NULL,
@@ -795,6 +841,10 @@ class OOSRegistry:
         self._connection.execute(
             "ALTER TABLE oos_test_records ADD COLUMN IF NOT EXISTS "
             "tested_strategy_versions_json VARCHAR"
+        )
+        self._connection.execute(
+            "ALTER TABLE oos_test_records ADD COLUMN IF NOT EXISTS "
+            "scanned_symbols_json VARCHAR"
         )
         self._connection.execute(
             """
