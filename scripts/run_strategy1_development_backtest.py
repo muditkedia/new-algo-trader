@@ -93,6 +93,7 @@ RESULTS_ROOT = (
 )
 OOS_REGISTRY_PATH = RESULTS_ROOT / "oos_registry.duckdb"
 MASTER_EXCEL_PATH = RESULTS_ROOT / "strategy1_research_master.xlsx"
+MASTER_JSON_PATH = RESULTS_ROOT / "strategy1_research_history.json"
 MASTER_VISUAL_DIR = RESULTS_ROOT / "research_visuals"
 MARGIN_SNAPSHOT_DIR = RESULTS_ROOT / "margin_snapshots"
 
@@ -119,6 +120,72 @@ FORCED_BACKTEST_EXIT_TIME = time(15, 25)
 
 BOOTSTRAP_MODEL_VERSION = "bootstrap-neutral-v1"
 DYNAMIC_EXIT_POLICY_ID = "R_MULTIPLE_TRAILING_V1"
+
+# Curated research decisions are intentionally explicit rather than inferred from performance.
+# Each strategy revision updates this history so the two upload artifacts preserve not only
+# numerical results, but also what changed, why it changed, and the next governed action.
+RESEARCH_DECISION_HISTORY: tuple[dict[str, object], ...] = (
+    {
+        "sequence": 1,
+        "strategy_version": "1.0.0",
+        "phase": "development",
+        "result": "FAILED",
+        "actual_trades": 162,
+        "net_profit": "-19502.48764415068104661877811",
+        "win_rate": "0.2530864197530864197530864198",
+        "net_profit_factor": "0.1866319084700740110969112158",
+        "average_net_return_per_trade": "-0.002411492744252698845966138186",
+        "trades_per_day": "2.655737704918032786885245902",
+        "maximum_realized_drawdown_pct": "0.1961371189003785863389663773",
+        "decision": "ITERATE_IN_DEVELOPMENT",
+        "analysis": (
+            "The broad baseline had negative gross expectancy before costs. High frequency did "
+            "not compensate for weak setup quality; costs amplified an already-negative edge."
+        ),
+        "changes_to_next_version": (
+            "v1.1.0: restrict structural levels to PDH/PDL only; raise same-slot RVOL threshold "
+            "from 2x to 12x; reduce hard target/trailing hard target from 1.5R to 1.25R. "
+            "Keep shock-z, ATR penetration/reclaim geometry, confirmation timing, stop geometry, "
+            "trailing triggers, hold time, symmetry, allocator, costs, and OOS policy unchanged."
+        ),
+        "rationale": (
+            "Prior-day extremes are cleaner liquidity pools; extreme relative volume selects "
+            "genuine exhaustion events; the modestly closer target reduces give-back without "
+            "rewriting the exit architecture."
+        ),
+        "next_action": "Run v1.1.0 on the same frozen development interval.",
+    },
+    {
+        "sequence": 2,
+        "strategy_version": "1.1.0",
+        "phase": "development",
+        "result": "PROMISING_RESEARCH_CANDIDATE",
+        "actual_trades": 12,
+        "net_profit": "1059.8702040205760457377932",
+        "win_rate": "0.75",
+        "net_profit_factor": "3.151103739986594739363932352",
+        "average_net_return_per_trade": "0.001773841990335495980511404343",
+        "trades_per_day": "0.1967213114754098360655737705",
+        "maximum_realized_drawdown_pct": "0.002204734360786662541483554752",
+        "decision": "ADVANCE_UNCHANGED_TO_OOS_001",
+        "analysis": (
+            "v1.1.0 reversed the baseline into positive gross and net expectancy, with 75% win "
+            "rate, net PF above 3, balanced LONG/SHORT participation, and very low realized "
+            "drawdown. CAGR and average net return remain below final gates, but only 12 "
+            "development trades exist. Further threshold tuning on those 12 observations would "
+            "be development-sample overfitting."
+        ),
+        "changes_to_next_version": "None. Keep v1.1.0 unchanged for OOS-001.",
+        "rationale": (
+            "The next information gain must come from untouched data. OOS-001 is the governed "
+            "test of whether the improved development edge generalizes."
+        ),
+        "next_action": (
+            "Run v1.1.0 unchanged with --mode next-oos. Review OOS-001 before authorization or "
+            "any later strategy revision."
+        ),
+    },
+)
 
 
 class _UnusedMarginProvider:
@@ -1041,6 +1108,66 @@ def _run_history_rows(
     return rows
 
 
+
+def _research_decision_rows() -> list[dict[str, object]]:
+    return [dict(row) for row in RESEARCH_DECISION_HISTORY]
+
+
+def rebuild_master_json(plan: OOSPlan | None) -> None:
+    """Write the single cumulative machine-readable upload artifact atomically."""
+    artifacts = _run_artifacts()
+    if not artifacts:
+        return
+
+    run_payloads: list[dict[str, object]] = []
+    for attempt, (report, manifest, run_directory) in enumerate(artifacts, start=1):
+        report_path = run_directory / "report_bundle.json"
+        manifest_path = run_directory / "run_manifest.json"
+        run_payloads.append(
+            {
+                "attempt": attempt,
+                "phase": manifest.get("phase"),
+                "window_id": report.provenance.window_id,
+                "run_id": report.provenance.run_id,
+                "strategy_version": manifest.get("strategy_version"),
+                "run_directory": run_directory.relative_to(RESULTS_ROOT).as_posix(),
+                "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                "manifest": manifest,
+                "report": report.model_dump(mode="json"),
+            }
+        )
+
+    payload = {
+        "schema_version": "1",
+        "research_scope_id": RESEARCH_SCOPE_ID,
+        "generated_at": datetime.now(IST).replace(microsecond=0).isoformat(),
+        "upload_contract": {
+            "machine_readable": MASTER_JSON_PATH.name,
+            "human_analysis": MASTER_EXCEL_PATH.name,
+            "instruction": (
+                "For review, upload only this cumulative JSON, the cumulative Excel workbook, "
+                "and the terminal output. Per-run Parquet/JSON/PNG artifacts remain internal "
+                "reproducibility evidence and do not need to be uploaded."
+            ),
+        },
+        "research_decision_history": _research_decision_rows(),
+        "run_history": _run_history_rows(artifacts),
+        "gate_history": _gate_history_rows(artifacts),
+        "oos_plan": _oos_plan_rows(plan),
+        "runs": run_payloads,
+    }
+
+    MASTER_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = MASTER_JSON_PATH.with_suffix(".tmp.json")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+        newline="\n",
+    )
+    os.replace(temp_path, MASTER_JSON_PATH)
+
+
 def _gate_history_rows(
     artifacts: list[tuple[ReportBundle, dict[str, object], Path]],
 ) -> list[dict[str, object]]:
@@ -1170,17 +1297,36 @@ def rebuild_master_workbook(plan: OOSPlan | None) -> None:
     oos_sheet = workbook.create_sheet("OOS Plan")
     _write_rows(oos_sheet, _oos_plan_rows(plan))
 
+    decisions = workbook.create_sheet("Research Decisions")
+    _write_rows(decisions, _research_decision_rows())
+
+    # Every canonical reporting table is rolled into the one cumulative workbook. The per-run
+    # Parquet files remain internal reproducibility evidence; users only need to upload this
+    # workbook plus MASTER_JSON_PATH for review.
     aggregate_specs = (
+        ("Summary History", "summary"),
         ("Actual Trades History", "actual_trades"),
         ("Shadow Trades History", "shadow_trades"),
+        ("Request Outcomes", "request_outcomes"),
+        ("Equity Curve History", "equity_curve"),
         ("Daily History", "daily_performance"),
+        ("Actual Strategy History", "actual_strategy_breakdown"),
+        ("Shadow Strategy History", "shadow_strategy_breakdown"),
+        ("Symbol History", "symbol_breakdown"),
+        ("Actual Cost Breakdown", "actual_cost_breakdown"),
+        ("Shadow Cost Breakdown", "shadow_cost_breakdown"),
+        ("Actual Exit History", "actual_exit_reason_breakdown"),
+        ("Shadow Exit History", "shadow_exit_reason_breakdown"),
+        ("Cumulative PnL", "cumulative_pnl"),
         ("Monthly History", "monthly_performance"),
         ("Side History", "side_performance"),
         ("Time Of Day History", "time_of_day_performance"),
-        ("Symbol History", "symbol_breakdown"),
-        ("Exit History", "actual_exit_reason_breakdown"),
-        ("Cost History", "cost_impact"),
+        ("Holding Time", "holding_time_distribution"),
+        ("Rolling Metrics", "rolling_trade_metrics"),
         ("Diagnostics History", "trade_diagnostics"),
+        ("Cost Impact", "cost_impact"),
+        ("Outcome Funnel", "outcome_funnel"),
+        ("Actual Shadow Compare", "actual_shadow_comparison"),
         ("Provenance History", "provenance"),
     )
     for sheet_name, table_name in aggregate_specs:
@@ -1736,8 +1882,10 @@ def main() -> None:
                 git_commit=git_commit,
                 requested_window_id=args.window_id,
             )
+        rebuild_master_json(updated_plan)
         rebuild_master_workbook(updated_plan)
         rebuild_master_visuals()
+        print(f"Cumulative research JSON updated: {MASTER_JSON_PATH}")
         print(f"Master Excel updated: {MASTER_EXCEL_PATH}")
         return
 
@@ -1877,15 +2025,17 @@ def main() -> None:
             )
             plan = registry.get_plan(RESEARCH_SCOPE_ID, PLAN_ID)
 
+    rebuild_master_json(plan)
     rebuild_master_workbook(plan)
     rebuild_master_visuals()
 
     print("\n=== ARTIFACT SUMMARY ===")
-    print(f"Single cumulative Excel workbook: {MASTER_EXCEL_PATH}")
-    print(f"Cumulative Matplotlib visuals: {MASTER_VISUAL_DIR}")
+    print("UPLOAD ONLY THESE TWO FILES FOR REVIEW:")
+    print(f"  JSON:  {MASTER_JSON_PATH}")
+    print(f"  Excel: {MASTER_EXCEL_PATH}")
     print(
-        "Canonical per-run machine-readable truth remains in each run's Parquet/JSON artifacts; "
-        "the cumulative Excel workbook is the single human-analysis workbook."
+        "Per-run Parquet/JSON artifacts and Matplotlib diagnostics remain internal reproducibility "
+        "evidence. They do not need to be uploaded for routine research review."
     )
 
     if args.mode == "development":
