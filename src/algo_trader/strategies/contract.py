@@ -16,6 +16,11 @@ class Strategy(Protocol):
 
     Runtime protocol checks confirm only that named members exist. Candle and
     signal semantics remain the responsibility of input/domain validation.
+
+    Historical/batch ``generate_signals`` output is deterministic and cumulative:
+    it contains every strategy decision available within the supplied completed-
+    candle history. Extending that history must retain all earlier Signals exactly,
+    including their ordering and immutable parameter and feature snapshots.
     """
 
     strategy_id: str
@@ -24,6 +29,5 @@ class Strategy(Protocol):
     warmup_bars: int
 
     def generate_signals(self, candles: pl.DataFrame) -> list[Signal]:
-        """Generate signals for one chronologically ordered symbol."""
+        """Return cumulative signals for one chronologically ordered symbol."""
         ...
-
