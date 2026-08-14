@@ -64,6 +64,10 @@ def test_manifest_contract_classification_and_normalized_uniqueness(
     )
     assert smartapi.category == "RUNTIME_VENDOR"
     assert smartapi.license_status == "VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED"
+    assert (
+        smartapi.redistribution_status
+        == "REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION"
+    )
     assert {
         component.normalized_name: component.category
         for component in components
@@ -144,8 +148,21 @@ def test_license_policy_requires_evidence_but_accepts_explicit_vendor_exception(
         project_evidence=("pyproject.toml",),
         license_status="VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED",
         license_metadata_note="fixture",
+        redistribution_status="REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION",
     )
     assert license_is_acceptable(smartapi, no_metadata)
+    assert not license_is_acceptable(
+        Component(
+            distribution_name="smartapi-python",
+            import_name="SmartApi",
+            category="RUNTIME_VENDOR",
+            role="fixture",
+            project_evidence=("pyproject.toml",),
+            license_status="VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED",
+            license_metadata_note="fixture",
+        ),
+        no_metadata,
+    )
     rendered = run_gate().render()
     assert "VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED" in rendered
     assert ".secrets" not in rendered
@@ -190,6 +207,15 @@ def test_cli_success_and_deliberately_missing_component_failure(
     assert main(["--manifest", str(missing_manifest)]) != 0
     failure = capsys.readouterr().out
     assert failure.rstrip().endswith("COMMUNITY COMPONENT GATE: FAIL")
+
+    wrong_status = tmp_path / "wrong-status.toml"
+    wrong_status.write_text(
+        manifest_text.replace(
+            "REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION", "UNREVIEWED", 1
+        ),
+        encoding="utf-8",
+    )
+    assert main(["--manifest", str(wrong_status)]) != 0
 
 
 def test_manifest_toml_parses_without_secret_or_data_configuration() -> None:

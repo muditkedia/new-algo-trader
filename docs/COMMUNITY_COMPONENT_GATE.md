@@ -10,7 +10,7 @@ packages.
 
 ## 2. Runtime community components
 
-The table records the environment validated for this architecture freeze. Installed
+The table records the environment validated for this architecture review. Installed
 versions may change within the declared constraints; the gate reports the exact local
 version and never queries for a newer release.
 
@@ -45,9 +45,12 @@ do not replace review of the applicable license text.
 `smartapi-python==1.5.5` is the required vendor integration. Its public source
 availability does not itself establish an open-source license, and the project must
 not infer redistribution rights from an unspecified license. External redistribution
-or productization must separately review Angel One's applicable terms. This explicit
-vendor exception passes the technical gate without relabeling the SDK as permissive
-open source.
+or productization requires a separate review of the currently applicable Angel One
+terms and rights before it occurs. The manifest records this prerequisite as
+`REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION`. This is an external legal/commercial
+prerequisite, not an unresolved software-architecture defect. The accepted technical
+integration and explicit vendor exception pass the technical gate without relabeling
+the SDK as permissive open source; this statement is not legal advice.
 
 ## 4. Development tools
 
@@ -72,7 +75,7 @@ gate; an incidentally installed package does not become a direct dependency.
 
 QuantStats remains a reporting reference only. MLflow remains conditional on the
 project's own artifact tracking proving insufficient. mlfinpy remains a selected
-technique/reference only. None is installed or declared for architecture freeze.
+technique/reference only. None is installed or declared for the current architecture.
 
 No core trading-engine dependency exists on VectorBT, Nautilus, LEAN, Backtrader,
 Backtesting.py, bt, or OpenAlgo. The platform deliberately uses a thin custom

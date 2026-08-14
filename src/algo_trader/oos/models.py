@@ -6,7 +6,14 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 StrictDate = Annotated[date, Field(strict=True)]
@@ -81,6 +88,7 @@ class OOSPlan(FrozenOOSModel):
     research_scope_id: NonEmptyStr
     plan_id: NonEmptyStr
     protocol_version: NonEmptyStr
+    strategy_ids: tuple[str, ...]
     data_start_date: StrictDate
     data_end_exclusive: StrictDate
     development_start_date: StrictDate
@@ -90,6 +98,11 @@ class OOSPlan(FrozenOOSModel):
     oos_windows: tuple[OOSWindow, ...]
     sealed_holdout: OOSWindow
     creation_audit: OOSAuditContext
+
+    @field_validator("strategy_ids", mode="before")
+    @classmethod
+    def normalize_strategy_ids(cls, value: object) -> tuple[str, ...]:
+        return _normalize_unique_strings(value, "strategy_ids")
 
     @model_validator(mode="after")
     def validate_partition(self) -> OOSPlan:
@@ -164,10 +177,44 @@ class OOSTestRecord(FrozenOOSModel):
     cost_policy_id: NonEmptyStr
     brokerage_plan: NonEmptyStr
     symbols: tuple[str, ...]
+    scope_strategy_ids: tuple[str, ...]
+    tested_strategy_versions: tuple[tuple[str, str], ...]
     strategy_versions: tuple[tuple[str, str], ...]
     ml_model_versions: tuple[str, ...]
     result_fingerprint: NonEmptyStr
     registration_audit: OOSAuditContext
+
+    @field_validator("scope_strategy_ids", mode="before")
+    @classmethod
+    def normalize_scope_strategy_ids(cls, value: object) -> tuple[str, ...]:
+        return _normalize_unique_strings(value, "scope_strategy_ids")
+
+    @field_validator("tested_strategy_versions", mode="before")
+    @classmethod
+    def normalize_tested_strategy_versions(
+        cls, value: object
+    ) -> tuple[tuple[str, str], ...]:
+        return normalize_strategy_versions(value)
+
+    @model_validator(mode="after")
+    def validate_strategy_lineage(self) -> OOSTestRecord:
+        outside_scope = sorted(
+            {strategy_id for strategy_id, _ in self.tested_strategy_versions}
+            - set(self.scope_strategy_ids)
+        )
+        if outside_scope:
+            raise ValueError(
+                "tested strategy IDs must belong to scope_strategy_ids: "
+                + ", ".join(outside_scope)
+            )
+        if self.strategy_versions and (
+            normalize_strategy_versions(self.strategy_versions)
+            != self.tested_strategy_versions
+        ):
+            raise ValueError(
+                "non-empty strategy_versions must exactly equal tested_strategy_versions"
+            )
+        return self
 
 
 class OOSTransitionRecord(FrozenOOSModel):
@@ -182,3 +229,47 @@ class OOSTransitionRecord(FrozenOOSModel):
     from_state: OOSWindowState | None
     to_state: OOSWindowState | None
     event_type: NonEmptyStr
+
+
+def normalize_strategy_versions(value: object) -> tuple[tuple[str, str], ...]:
+    """Normalize explicit tested strategy/version lineage deterministically."""
+    if isinstance(value, str) or value is None:
+        raise ValueError("tested_strategy_versions must be a non-empty iterable")
+    try:
+        selected = tuple(value)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError("tested_strategy_versions must be iterable") from error
+    if not selected:
+        raise ValueError("tested_strategy_versions must be non-empty")
+    normalized = []
+    for item in selected:
+        if not isinstance(item, tuple | list) or len(item) != 2:
+            raise TypeError("each tested strategy version must be a two-item pair")
+        strategy_id, strategy_version = item
+        if not isinstance(strategy_id, str) or not strategy_id.strip():
+            raise ValueError("tested strategy_id must be non-empty")
+        if not isinstance(strategy_version, str) or not strategy_version.strip():
+            raise ValueError("tested strategy_version must be non-empty")
+        normalized.append((strategy_id.strip(), strategy_version.strip()))
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("tested_strategy_versions must not contain duplicates")
+    return tuple(sorted(normalized))
+
+
+def _normalize_unique_strings(value: object, name: str) -> tuple[str, ...]:
+    if isinstance(value, str) or value is None:
+        raise ValueError(f"{name} must be a non-empty iterable")
+    try:
+        selected = tuple(value)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(f"{name} must be iterable") from error
+    if not selected:
+        raise ValueError(f"{name} must contain at least one value")
+    normalized = []
+    for item in selected:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{name} values must be non-empty strings")
+        normalized.append(item.strip())
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{name} must not contain duplicates")
+    return tuple(sorted(normalized))

@@ -15,7 +15,7 @@ from algo_trader.oos.models import (
 )
 
 SEALED_HOLDOUT_WINDOW_ID = "sealed-holdout"
-DEFAULT_OOS_PROTOCOL_VERSION = "1"
+DEFAULT_OOS_PROTOCOL_VERSION = "2"
 
 
 def shift_calendar_months(value: date, months: int) -> date:
@@ -35,6 +35,7 @@ def create_oos_plan(
     *,
     research_scope_id: str,
     plan_id: str,
+    strategy_ids: Iterable[str],
     data_start_date: date,
     data_end_exclusive: date,
     oos_windows: Iterable[OOSWindowSpec],
@@ -42,6 +43,14 @@ def create_oos_plan(
     protocol_version: str = DEFAULT_OOS_PROTOCOL_VERSION,
 ) -> OOSPlan:
     """Create one immutable plan with caller-sized ordinary OOS windows."""
+    if strategy_ids is None or isinstance(strategy_ids, str):
+        raise TypeError("strategy_ids must be a non-string iterable of strategy IDs")
+    try:
+        selected_strategy_ids = tuple(strategy_ids)
+    except TypeError as error:
+        raise TypeError(
+            "strategy_ids must be a non-string iterable of strategy IDs"
+        ) from error
     if isinstance(data_start_date, datetime) or not isinstance(data_start_date, date):
         raise TypeError("data_start_date must be a date")
     if isinstance(data_end_exclusive, datetime) or not isinstance(
@@ -73,6 +82,7 @@ def create_oos_plan(
         research_scope_id=research_scope_id,
         plan_id=plan_id,
         protocol_version=protocol_version,
+        strategy_ids=selected_strategy_ids,
         data_start_date=data_start_date,
         data_end_exclusive=data_end_exclusive,
         development_start_date=data_start_date,

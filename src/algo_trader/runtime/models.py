@@ -9,7 +9,14 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from algo_trader.broker import (
     BrokerOrderAcknowledgement,
@@ -27,7 +34,7 @@ from algo_trader.portfolio import (
     MarginRequirementQuote,
 )
 
-RUNTIME_ARCHITECTURE_VERSION = "1"
+RUNTIME_ARCHITECTURE_VERSION = "2"
 MARKET_TIMEZONE_NAME = "Asia/Kolkata"
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
@@ -132,6 +139,16 @@ class RuntimeConfig(FrozenRuntimeModel):
     market_timezone: Literal["Asia/Kolkata"] = MARKET_TIMEZONE_NAME
     scheduler_misfire_grace_seconds: int = Field(default=60, strict=True, gt=0)
     stale_market_data_seconds: int = Field(default=30, strict=True, gt=0)
+    stream_shutdown_timeout_seconds: float = Field(
+        default=10.0, strict=True, gt=0, allow_inf_nan=False
+    )
+
+    @field_validator("stream_shutdown_timeout_seconds", mode="before")
+    @classmethod
+    def reject_boolean_timeout(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("stream_shutdown_timeout_seconds must be a positive finite number")
+        return value
 
 
 class RuntimeTradePlan(FrozenRuntimeModel):
@@ -148,7 +165,7 @@ class RuntimeSessionRecord(FrozenRuntimeModel):
     runtime_session_id: NonEmptyStr
     trading_date: date
     mode: RuntimeMode
-    runtime_version: Literal["1"] = RUNTIME_ARCHITECTURE_VERSION
+    runtime_version: Literal["2"] = RUNTIME_ARCHITECTURE_VERSION
     phase: RuntimePhase = RuntimePhase.CREATED
     starting_capital: PositiveDecimal
     current_capital: FiniteDecimal

@@ -434,7 +434,7 @@ class RuntimeService:
             self._stream_thread = Thread(
                 target=self._run_stream_connect,
                 name=f"runtime-stream-{self.runtime_session_id}",
-                daemon=False,
+                daemon=True,
             )
             self._stream_thread.start()
 
@@ -469,6 +469,7 @@ class RuntimeService:
         """Explicitly close external resources; unsafe exposure retains HALTED phase."""
         now = self._at(occurred_at)
         stream_thread: Thread | None = None
+        stream_shutdown_timed_out = False
         if self.stream is not None and self._stream_connected:
             try:
                 if self._subscribed_instruments:
@@ -478,10 +479,19 @@ class RuntimeService:
             self.stream.close()
             stream_thread = self._stream_thread
             if stream_thread is not None:
-                stream_thread.join()
+                stream_thread.join(timeout=self.config.stream_shutdown_timeout_seconds)
                 if stream_thread.is_alive():
-                    raise RuntimeError("market-data stream thread did not stop")
+                    stream_shutdown_timed_out = True
         with self._lock:
+            if stream_shutdown_timed_out:
+                if self.phase is not RuntimePhase.HALTED:
+                    self.halt("market-data stream thread shutdown timed out", now)
+                self.state_store.append_event(
+                    self.runtime_session_id,
+                    now,
+                    "STREAM_THREAD_SHUTDOWN_TIMEOUT",
+                    "stream thread remained alive after bounded shutdown wait",
+                )
             if self.config.mode is RuntimeMode.LIVE:
                 try:
                     self.reconcile(now)

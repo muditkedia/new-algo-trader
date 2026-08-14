@@ -366,6 +366,8 @@ def write_excel_report(report: ReportBundle, output_path: Path) -> Path:
 
 
 def _save_plot(path: Path, title: str, draw: Any) -> None:
+    if path.exists():
+        raise FileExistsError(f"visual report path already exists: {path}")
     figure, axis = plt.subplots(figsize=(10, 5), dpi=120)
     draw(axis)
     axis.set_title(title)
@@ -386,6 +388,22 @@ def write_visual_report(report: ReportBundle, output_directory: Path) -> tuple[P
         raise TypeError("report must be a ReportBundle")
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
+    filenames = [
+        "realized_equity_curve.png",
+        "realized_drawdown.png",
+        "daily_net_pnl.png",
+        "trade_net_returns.png",
+        "strategy_net_pnl.png",
+        "cost_composition.png",
+        "request_outcomes.png",
+        "exit_reason_counts.png",
+    ]
+    if report.shadow_trade_records:
+        filenames.append("shadow_trade_net_returns.png")
+    paths_to_write = tuple(directory / filename for filename in filenames)
+    existing = tuple(path for path in paths_to_write if path.exists())
+    if existing:
+        raise FileExistsError(f"visual report path already exists: {existing[0]}")
     tables = report_tables(report)
     paths: list[Path] = []
 

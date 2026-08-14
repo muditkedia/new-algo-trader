@@ -64,6 +64,7 @@ FORBIDDEN_DIRECT = frozenset(
     )
 )
 NONTERMINAL_LICENSE_STATUSES = {"", "UNKNOWN", "UNREVIEWED", "MISSING"}
+SMARTAPI_REDISTRIBUTION_STATUS = "REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +77,7 @@ class Component:
     license_metadata_note: str
     import_name: str | None = None
     executable_name: str | None = None
+    redistribution_status: str | None = None
 
     @property
     def normalized_name(self) -> str:
@@ -210,6 +212,7 @@ def load_manifest(
             project_evidence=tuple(evidence),
             license_status=_required_string(row, "license_status"),
             license_metadata_note=_required_string(row, "license_metadata_note"),
+            redistribution_status=_optional_string(row, "redistribution_status"),
         )
         if component.category not in CATEGORIES:
             raise ValueError(f"invalid component category: {component.category}")
@@ -282,6 +285,7 @@ def license_is_acceptable(
         return (
             component.normalized_name == "smartapi-python"
             and component.license_status == "VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED"
+            and component.redistribution_status == SMARTAPI_REDISTRIBUTION_STATUS
         )
     if component.license_status.upper() in NONTERMINAL_LICENSE_STATUSES:
         return False

@@ -9,10 +9,12 @@ from pydantic import ValidationError
 from algo_trader.backtest import BacktestRunResult
 from algo_trader.costs import BrokeragePlan
 from algo_trader.oos import (
+    DEFAULT_OOS_PROTOCOL_VERSION,
     SEALED_HOLDOUT_WINDOW_ID,
     OOSAuditContext,
     OOSPlan,
     OOSRegistry,
+    OOSTestRecord,
     OOSWindowSpec,
     OOSWindowState,
     create_oos_plan,
@@ -55,10 +57,12 @@ def make_plan(
     data_start: date = date(2023, 1, 1),
     data_end: date = date(2026, 1, 1),
     windows: tuple[OOSWindowSpec, ...] | None = None,
+    strategy_ids: tuple[str, ...] = ("strategy",),
 ) -> OOSPlan:
     return create_oos_plan(
         research_scope_id=scope,
         plan_id=plan_id,
+        strategy_ids=strategy_ids,
         data_start_date=data_start,
         data_end_exclusive=data_end,
         oos_windows=windows if windows is not None else specs(),
@@ -106,6 +110,7 @@ def register_first(registry: OOSRegistry, scope: str, plan_id: str, event: str =
         window.window_id,
         make_result(window.start_date, window.end_date),
         audit(event, 1),
+        (("strategy", "1"),),
     )
 
 
@@ -128,6 +133,8 @@ def test_calendar_month_shift_clamps_deterministically(
 def test_plan_has_exact_final_twelve_calendar_month_holdout() -> None:
     plan = make_plan()
 
+    assert DEFAULT_OOS_PROTOCOL_VERSION == "2"
+    assert plan.protocol_version == "2"
     assert plan.sealed_holdout_start_date == date(2025, 1, 1)
     assert plan.sealed_holdout_end_exclusive == date(2026, 1, 1)
     assert plan.sealed_holdout.state is OOSWindowState.SEALED_HOLDOUT
@@ -279,6 +286,168 @@ def test_models_are_immutable() -> None:
         plan.plan_id = "changed"
 
 
+def test_strategy_binding_is_normalized_persisted_and_scope_stable(tmp_path: Path) -> None:
+    plan = make_plan(strategy_ids=[" beta ", "alpha"])
+    assert plan.strategy_ids == ("alpha", "beta")
+    with pytest.raises(ValidationError, match="duplicates"):
+        make_plan(strategy_ids=("alpha", " alpha "))
+    with OOSRegistry(tmp_path / "oos.duckdb") as registry:
+        registry.create_plan(plan)
+        assert registry.get_plan("scope-a", "plan-a").strategy_ids == (
+            "alpha",
+            "beta",
+        )
+        with pytest.raises(ValueError, match="binding"):
+            registry.create_plan(
+                make_plan(
+                    plan_id="drift",
+                    data_start=date(2026, 1, 1),
+                    data_end=date(2029, 1, 1),
+                    windows=(
+                        OOSWindowSpec(
+                            window_id="later",
+                            start_date=date(2027, 1, 1),
+                            end_date=date(2028, 1, 1),
+                        ),
+                    ),
+                    strategy_ids=("alpha",),
+                )
+            )
+
+
+@pytest.mark.parametrize("strategy_ids", ["strategy-a", " ", None])
+def test_create_oos_plan_rejects_non_container_strategy_ids(
+    strategy_ids: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="strategy_ids"):
+        make_plan(strategy_ids=strategy_ids)  # type: ignore[arg-type]
+
+
+def test_create_oos_plan_normalizes_supported_strategy_iterables() -> None:
+    assert make_plan(strategy_ids=("strategy-a",)).strategy_ids == ("strategy-a",)
+    assert make_plan(strategy_ids=[" beta ", "alpha"]).strategy_ids == (
+        "alpha",
+        "beta",
+    )
+    with pytest.raises(ValidationError, match="duplicates"):
+        make_plan(strategy_ids=("alpha", " alpha "))
+
+
+def direct_test_record(**updates: object) -> OOSTestRecord:
+    result = make_result(date(2024, 1, 1), date(2024, 7, 1))
+    values: dict[str, object] = {
+        "research_scope_id": "scope-a",
+        "plan_id": "plan-a",
+        "window_id": "w1",
+        "backtest_run_id": result.run_id,
+        "backtest_git_commit": result.git_commit,
+        "backtester_version": result.backtester_version,
+        "backtest_window_start": result.window_start,
+        "backtest_window_end": result.window_end,
+        "cost_policy_id": result.cost_policy_id,
+        "brokerage_plan": result.brokerage_plan.value,
+        "symbols": result.symbols,
+        "scope_strategy_ids": ("strategy",),
+        "tested_strategy_versions": (("strategy", "1"),),
+        "strategy_versions": (("strategy", "1"),),
+        "ml_model_versions": result.ml_model_versions,
+        "result_fingerprint": fingerprint_backtest_result(result),
+        "registration_audit": audit("direct-record"),
+    }
+    return OOSTestRecord(**(values | updates))
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"scope_strategy_ids": ()}, "scope_strategy_ids"),
+        ({"tested_strategy_versions": ()}, "tested_strategy_versions"),
+        (
+            {
+                "tested_strategy_versions": (("foreign", "1"),),
+                "strategy_versions": (("foreign", "1"),),
+            },
+            "belong",
+        ),
+        ({"tested_strategy_versions": (("strategy", "2"),)}, "exactly equal"),
+    ],
+)
+def test_oos_test_record_rejects_inconsistent_v2_lineage(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        direct_test_record(**updates)
+
+
+def test_oos_test_record_normalizes_lineage_and_accepts_zero_signal_attestation() -> None:
+    record = direct_test_record(
+        scope_strategy_ids=[" beta ", "alpha"],
+        tested_strategy_versions=[(" beta ", "2"), ("alpha", "1")],
+        strategy_versions=(),
+    )
+    assert record.scope_strategy_ids == ("alpha", "beta")
+    assert record.tested_strategy_versions == (("alpha", "1"), ("beta", "2"))
+    assert record.strategy_versions == ()
+
+
+def test_legacy_unbound_scope_fails_closed_without_inference(tmp_path: Path) -> None:
+    with OOSRegistry(tmp_path / "oos.duckdb") as registry:
+        registry.create_plan(make_plan())
+        registry._connection.execute(
+            "DELETE FROM oos_research_scope_strategies WHERE research_scope_id = ?",
+            ["scope-a"],
+        )
+        with pytest.raises(RuntimeError, match="legacy.*binding"):
+            registry.get_plan("scope-a", "plan-a")
+
+
+@pytest.mark.parametrize(
+    ("attestation", "message"),
+    [
+        ((), "non-empty"),
+        ((("outside", "1"),), "outside"),
+        ((("strategy", "2"),), "exactly"),
+    ],
+)
+def test_tested_strategy_attestation_rejects_invalid_input_before_mutation(
+    tmp_path: Path,
+    attestation: tuple[tuple[str, str], ...],
+    message: str,
+) -> None:
+    with OOSRegistry(tmp_path / "oos.duckdb") as registry:
+        registry.create_plan(make_plan())
+        result = make_result(date(2024, 1, 1), date(2024, 7, 1))
+        with pytest.raises(ValueError, match=message):
+            registry.register_test_result(
+                "scope-a", "plan-a", "w1", result, audit("invalid"), attestation
+            )
+        assert registry.next_testable_window("scope-a", "plan-a").window_id == "w1"
+        with pytest.raises(LookupError):
+            registry.get_test_record("scope-a", "plan-a", "w1")
+
+
+def test_empty_result_requires_and_persists_explicit_strategy_attestation(
+    tmp_path: Path,
+) -> None:
+    result = make_result(date(2024, 1, 1), date(2024, 7, 1)).model_copy(
+        update={"strategy_versions": (), "ml_model_versions": ()}
+    )
+    with OOSRegistry(tmp_path / "oos.duckdb") as registry:
+        registry.create_plan(make_plan())
+        record = registry.register_test_result(
+            "scope-a",
+            "plan-a",
+            "w1",
+            result,
+            audit("empty"),
+            (("strategy", "1"),),
+        )
+        assert record.scope_strategy_ids == ("strategy",)
+        assert record.tested_strategy_versions == (("strategy", "1"),)
+        assert registry.get_test_record("scope-a", "plan-a", "w1") == record
+
+
 def test_different_scopes_can_persist_identical_horizons_and_window_ids(
     tmp_path: Path,
 ) -> None:
@@ -344,7 +513,12 @@ def test_exact_backtest_result_registration_and_provenance(tmp_path: Path) -> No
     with OOSRegistry(tmp_path / "oos.duckdb") as registry:
         registry.create_plan(make_plan(event_id="create"))
         record = registry.register_test_result(
-            "scope-a", "plan-a", "w1", result, audit("tested", 1)
+            "scope-a",
+            "plan-a",
+            "w1",
+            result,
+            audit("tested", 1),
+            result.strategy_versions,
         )
         persisted = registry.get_test_record("scope-a", "plan-a", "w1")
 
@@ -385,6 +559,7 @@ def test_non_exact_backtest_window_is_rejected(
                 "w1",
                 make_result(start, end),
                 audit("test", 1),
+                (("strategy", "1"),),
             )
 
 
@@ -400,6 +575,7 @@ def test_duplicate_run_and_window_retesting_are_rejected(tmp_path: Path) -> None
                 "w1",
                 make_result(date(2024, 1, 1), date(2024, 7, 1), run_id="new-run"),
                 audit("retest", 2),
+                (("strategy", "1"),),
             )
 
 
@@ -450,6 +626,7 @@ def test_duplicate_run_id_is_rejected_within_plan_across_windows(
                 "w2",
                 make_result(date(2024, 7, 1), date(2025, 1, 1), run_id="run-1"),
                 audit("test-w2", 4),
+                (("strategy", "1"),),
             )
         assert registry.get_plan("scope-a", "plan-a").oos_windows[1].state is (
             OOSWindowState.AVAILABLE
@@ -650,6 +827,7 @@ def test_holdout_rejects_all_ordinary_operations_and_no_release_api_exists(
                 SEALED_HOLDOUT_WINDOW_ID,
                 make_result(date(2025, 1, 1), date(2026, 1, 1)),
                 audit("test-holdout", 3),
+                (("strategy", "1"),),
             )
 
         assert not hasattr(registry, "unseal")

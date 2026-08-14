@@ -3,6 +3,7 @@
 from algo_trader.ml.artifacts import (
     ARTIFACT_FILES,
     ModelArtifactIntegrityError,
+    inspect_trade_meta_model_artifact,
     load_trade_meta_model,
     save_trade_meta_model,
 )
@@ -30,6 +31,7 @@ from algo_trader.ml.models import (
     FloatParameterSpec,
     IntParameterSpec,
     MetaFeatureSchema,
+    MetaModelArtifactIdentity,
     MetaModelEvaluation,
     MetaModelMetadata,
     MetaModelTrainingConfig,
@@ -68,6 +70,7 @@ __all__ = [
     "IntParameterSpec",
     "MetaFeatureSchema",
     "MetaModelEvaluation",
+    "MetaModelArtifactIdentity",
     "MetaModelEvaluationIntegrityError",
     "MetaModelMetadata",
     "MetaModelTrainingConfig",
@@ -91,6 +94,7 @@ __all__ = [
     "extract_meta_features",
     "extract_meta_training_samples",
     "load_trade_meta_model",
+    "inspect_trade_meta_model_artifact",
     "optimize_strategy_parameters",
     "parameter_distance",
     "recommended_notional_for_quality",

@@ -21,6 +21,7 @@ from algo_trader.oos.models import (
     OOSTransitionRecord,
     OOSWindow,
     OOSWindowState,
+    normalize_strategy_versions,
 )
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
@@ -61,6 +62,23 @@ class OOSRegistry:
             raise ValueError("new plans require all ordinary OOS windows to be AVAILABLE")
         with self._transaction():
             self._assert_event_id_available(plan.creation_audit.event_id)
+            existing_scope_plans = self._connection.execute(
+                "SELECT COUNT(*) FROM oos_plans WHERE research_scope_id = ?",
+                [plan.research_scope_id],
+            ).fetchone()[0]
+            binding_rows = self._connection.execute(
+                """SELECT strategy_id FROM oos_research_scope_strategies
+                   WHERE research_scope_id = ? ORDER BY ordinal""",
+                [plan.research_scope_id],
+            ).fetchall()
+            existing_binding = tuple(row[0] for row in binding_rows)
+            if existing_scope_plans and not existing_binding:
+                raise RuntimeError(
+                    "legacy OOS research scope has no explicit strategy binding; "
+                    "recreate the v1 registry with explicit v2 lineage"
+                )
+            if existing_binding and existing_binding != plan.strategy_ids:
+                raise ValueError("research scope strategy binding cannot drift")
             overlap = self._connection.execute(
                 """
                 SELECT plan_id
@@ -100,6 +118,12 @@ class OOSRegistry:
                     audit.git_commit,
                 ],
             )
+            if not existing_binding:
+                for ordinal, strategy_id in enumerate(plan.strategy_ids):
+                    self._connection.execute(
+                        "INSERT INTO oos_research_scope_strategies VALUES (?, ?, ?)",
+                        [plan.research_scope_id, strategy_id, ordinal],
+                    )
             for ordinal, window in enumerate(
                 (*plan.oos_windows, plan.sealed_holdout)
             ):
@@ -162,10 +186,21 @@ class OOSRegistry:
         )
         if len(holdouts) != 1:
             raise RuntimeError("persisted OOS plan must contain exactly one holdout")
+        binding_rows = self._connection.execute(
+            """SELECT strategy_id FROM oos_research_scope_strategies
+               WHERE research_scope_id = ? ORDER BY ordinal""",
+            [research_scope_id],
+        ).fetchall()
+        if not binding_rows:
+            raise RuntimeError(
+                "legacy OOS plan has no explicit strategy binding; "
+                "recreate the v1 registry with explicit v2 lineage"
+            )
         return OOSPlan(
             research_scope_id=row[0],
             plan_id=row[1],
             protocol_version=row[2],
+            strategy_ids=tuple(item[0] for item in binding_rows),
             data_start_date=row[3],
             data_end_exclusive=row[4],
             development_start_date=row[5],
@@ -202,12 +237,39 @@ class OOSRegistry:
         window_id: str,
         result: BacktestRunResult,
         audit_context: OOSAuditContext,
+        tested_strategy_versions: object,
     ) -> OOSTestRecord:
         """Register exactly one complete result for the current testable window."""
         if not isinstance(result, BacktestRunResult):
             raise TypeError("result must be a BacktestRunResult")
         if not isinstance(audit_context, OOSAuditContext):
             raise TypeError("audit_context must be an OOSAuditContext")
+        attestation = normalize_strategy_versions(tested_strategy_versions)
+        plan = self.get_plan(research_scope_id, plan_id)
+        outside_scope = sorted(
+            {strategy_id for strategy_id, _ in attestation} - set(plan.strategy_ids)
+        )
+        if outside_scope:
+            raise ValueError(
+                "tested strategy IDs are outside the research scope binding: "
+                + ",".join(outside_scope)
+            )
+        result_versions = tuple(sorted(result.strategy_versions))
+        if result_versions:
+            if result_versions != attestation:
+                raise ValueError(
+                    "Backtest strategy_versions must exactly equal tested_strategy_versions"
+                )
+        elif any(
+            (
+                result.request_results,
+                result.actual_trade_records,
+                result.shadow_trade_records,
+            )
+        ):
+            raise ValueError(
+                "empty Backtest strategy_versions require a completely empty result"
+            )
         window = self._ordinary_window(research_scope_id, plan_id, window_id)
         current = self.next_testable_window(research_scope_id, plan_id)
         if current is None or current.window_id != window.window_id:
@@ -240,6 +302,8 @@ class OOSRegistry:
             cost_policy_id=result.cost_policy_id,
             brokerage_plan=result.brokerage_plan.value,
             symbols=result.symbols,
+            scope_strategy_ids=plan.strategy_ids,
+            tested_strategy_versions=attestation,
             strategy_versions=result.strategy_versions,
             ml_model_versions=result.ml_model_versions,
             result_fingerprint=fingerprint_backtest_result(result),
@@ -274,9 +338,15 @@ class OOSRegistry:
                 raise ValueError("OOS window has already been tested")
             self._connection.execute(
                 """
-                INSERT INTO oos_test_records VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
+                INSERT INTO oos_test_records (
+                    research_scope_id, plan_id, window_id, backtest_run_id,
+                    backtest_git_commit, backtester_version, backtest_window_start,
+                    backtest_window_end, cost_policy_id, brokerage_plan, symbols_json,
+                    strategy_versions_json, ml_model_versions_json, result_fingerprint,
+                    registration_event_id, registration_occurred_at,
+                    registration_git_commit, scope_strategy_ids_json,
+                    tested_strategy_versions_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     record.research_scope_id,
@@ -296,6 +366,8 @@ class OOSRegistry:
                     audit_context.event_id,
                     audit_context.occurred_at.isoformat(),
                     audit_context.git_commit,
+                    _canonical_json(record.scope_strategy_ids),
+                    _canonical_json(record.tested_strategy_versions),
                 ],
             )
             self._set_window_state(
@@ -435,6 +507,10 @@ class OOSRegistry:
         ).fetchone()
         if row is None:
             raise LookupError("no OOS test record for the requested window")
+        if row[17] is None or row[18] is None:
+            raise RuntimeError(
+                "legacy OOS test record lacks explicit v2 strategy lineage"
+            )
         return OOSTestRecord(
             research_scope_id=row[0],
             plan_id=row[1],
@@ -454,6 +530,10 @@ class OOSRegistry:
                 event_id=row[14],
                 occurred_at=datetime.fromisoformat(row[15]),
                 git_commit=row[16],
+            ),
+            scope_strategy_ids=tuple(json.loads(row[17])),
+            tested_strategy_versions=tuple(
+                tuple(item) for item in json.loads(row[18])
             ),
         )
 
@@ -659,6 +739,17 @@ class OOSRegistry:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS oos_research_scope_strategies (
+                research_scope_id VARCHAR NOT NULL,
+                strategy_id VARCHAR NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY (research_scope_id, strategy_id),
+                UNIQUE (research_scope_id, ordinal)
+            )
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS oos_windows (
                 research_scope_id VARCHAR NOT NULL,
                 plan_id VARCHAR NOT NULL,
@@ -696,6 +787,14 @@ class OOSRegistry:
                 UNIQUE (research_scope_id, plan_id, backtest_run_id)
             )
             """
+        )
+        self._connection.execute(
+            "ALTER TABLE oos_test_records ADD COLUMN IF NOT EXISTS "
+            "scope_strategy_ids_json VARCHAR"
+        )
+        self._connection.execute(
+            "ALTER TABLE oos_test_records ADD COLUMN IF NOT EXISTS "
+            "tested_strategy_versions_json VARCHAR"
         )
         self._connection.execute(
             """

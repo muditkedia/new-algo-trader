@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from algo_trader.backtest import BacktestRequestOutcome, BacktestRunResult, BacktestTradeRecord
 from algo_trader.ml.models import (
+    MetaModelArtifactIdentity,
     MetaModelEvaluation,
     QualityBucketMetrics,
     SizeBucketMetrics,
@@ -29,25 +30,30 @@ class MetaModelEvaluationIntegrityError(ValueError):
 
 def evaluate_trade_meta_model(
     backtest_result: BacktestRunResult,
-    model_version: str,
+    model_identity: MetaModelArtifactIdentity,
     oos_test_record: OOSTestRecord | None = None,
 ) -> MetaModelEvaluation:
     """Evaluate embedded model scores over completed actual and shadow labels."""
     if not isinstance(backtest_result, BacktestRunResult):
         raise TypeError("backtest_result must be a BacktestRunResult")
-    if not isinstance(model_version, str) or not model_version.strip():
-        raise ValueError("model_version must be a non-empty string")
+    if not isinstance(model_identity, MetaModelArtifactIdentity):
+        raise TypeError("model_identity must be a MetaModelArtifactIdentity")
     fingerprint = fingerprint_backtest_result(backtest_result)
-    oos_values = _verify_oos(backtest_result, oos_test_record, fingerprint)
+    oos_values = _verify_oos(
+        backtest_result, oos_test_record, fingerprint, model_identity
+    )
+    _reject_same_version_lineage_collisions(backtest_result, model_identity)
     actual = tuple(
         record
         for record in backtest_result.actual_trade_records
-        if record.trade.ml_score.model_version == model_version
+        if record.trade.ml_score.model_version == model_identity.model_version
+        and record.trade.signal.strategy_id in model_identity.allowed_strategy_ids
     )
     shadow = tuple(
         record
         for record in backtest_result.shadow_trade_records
-        if record.trade.ml_score.model_version == model_version
+        if record.trade.ml_score.model_version == model_identity.model_version
+        and record.trade.signal.strategy_id in model_identity.allowed_strategy_ids
     )
     records = tuple(sorted((*actual, *shadow), key=_record_key))
     labels = tuple(int(record.trade.net_pnl > 0) for record in records)
@@ -62,7 +68,9 @@ def evaluate_trade_meta_model(
     outcome_counts = Counter(
         request.outcome
         for request in backtest_result.request_results
-        if request.request.candidate.ml_score.model_version == model_version
+        if request.request.candidate.ml_score.model_version == model_identity.model_version
+        and request.request.candidate.order_intent.signal.strategy_id
+        in model_identity.allowed_strategy_ids
     )
     quality_buckets = _quality_buckets(records)
     size_buckets = _size_buckets(records)
@@ -78,7 +86,11 @@ def evaluate_trade_meta_model(
     )
     size_returns = tuple(bucket.average_realized_net_return for bucket in size_buckets)
     return MetaModelEvaluation(
-        model_version=model_version,
+        research_scope_id=model_identity.research_scope_id,
+        plan_id=model_identity.plan_id,
+        model_version=model_identity.model_version,
+        allowed_strategy_ids=model_identity.allowed_strategy_ids,
+        artifact_fingerprint=model_identity.artifact_fingerprint,
         source_backtest_fingerprint=fingerprint,
         labeled_count=count,
         actual_labeled_count=len(actual),
@@ -190,9 +202,10 @@ def _verify_oos(
     result: BacktestRunResult,
     record: OOSTestRecord | None,
     fingerprint: str,
+    identity: MetaModelArtifactIdentity,
 ) -> dict[str, str | None]:
     if record is None:
-        return {"research_scope_id": None, "plan_id": None, "window_id": None}
+        return {"window_id": None}
     if not isinstance(record, OOSTestRecord):
         raise TypeError("oos_test_record must be an OOSTestRecord or None")
     comparisons = (
@@ -211,11 +224,61 @@ def _verify_oos(
         raise MetaModelEvaluationIntegrityError("OOS provenance does not match backtest result")
     if record.result_fingerprint != fingerprint:
         raise MetaModelEvaluationIntegrityError("OOS result fingerprint does not match")
-    return {
-        "research_scope_id": record.research_scope_id,
-        "plan_id": record.plan_id,
-        "window_id": record.window_id,
+    if (
+        record.research_scope_id != identity.research_scope_id
+        or record.plan_id != identity.plan_id
+        or record.scope_strategy_ids != identity.allowed_strategy_ids
+    ):
+        raise MetaModelEvaluationIntegrityError(
+            "OOS scope, plan, or strategy binding does not match model identity"
+        )
+    outside_tested = sorted(
+        {strategy_id for strategy_id, _ in record.tested_strategy_versions}
+        - set(identity.allowed_strategy_ids)
+    )
+    if outside_tested:
+        raise MetaModelEvaluationIntegrityError(
+            "OOS tested strategy lineage is outside model identity: "
+            + ", ".join(outside_tested)
+        )
+    if result.strategy_versions:
+        if record.tested_strategy_versions != tuple(sorted(result.strategy_versions)):
+            raise MetaModelEvaluationIntegrityError(
+                "OOS tested strategy versions do not match backtest provenance"
+            )
+    elif any(
+        (
+            result.request_results,
+            result.actual_trade_records,
+            result.shadow_trade_records,
+        )
+    ):
+        raise MetaModelEvaluationIntegrityError(
+            "empty backtest strategy provenance requires a zero-signal result"
+        )
+    return {"window_id": record.window_id}
+
+
+def _reject_same_version_lineage_collisions(
+    result: BacktestRunResult,
+    identity: MetaModelArtifactIdentity,
+) -> None:
+    strategy_ids = {
+        record.trade.signal.strategy_id
+        for record in (*result.actual_trade_records, *result.shadow_trade_records)
+        if record.trade.ml_score.model_version == identity.model_version
     }
+    strategy_ids.update(
+        request.request.candidate.order_intent.signal.strategy_id
+        for request in result.request_results
+        if request.request.candidate.ml_score.model_version == identity.model_version
+    )
+    outside = sorted(strategy_ids - set(identity.allowed_strategy_ids))
+    if outside:
+        raise MetaModelEvaluationIntegrityError(
+            "same model_version appears outside the artifact strategy lineage: "
+            + ", ".join(outside)
+        )
 
 
 def _record_key(record: BacktestTradeRecord) -> tuple[object, ...]:

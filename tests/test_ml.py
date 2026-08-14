@@ -3,10 +3,17 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import optuna
 import pytest
 from pydantic import ValidationError
 
-from algo_trader.backtest import BacktestRunResult, BacktestTradeRecord
+from algo_trader.backtest import (
+    BacktestRequestOutcome,
+    BacktestRequestResult,
+    BacktestRunResult,
+    BacktestTradeRecord,
+    BacktestTradeRequest,
+)
 from algo_trader.costs import BrokeragePlan, LegCostBreakdown, RoundTripCostBreakdown
 from algo_trader.domain import (
     ExitReason,
@@ -20,7 +27,9 @@ from algo_trader.domain import (
 )
 from algo_trader.ml import (
     ARTIFACT_FILES,
+    ML_ARCHITECTURE_VERSION,
     OBJECTIVE_DIRECTIONS,
+    STRATEGY_OPTIMIZER_VERSION,
     BootstrapTradeScorer,
     CategoricalParameterSpec,
     DuplicateTrainingObservationError,
@@ -29,6 +38,8 @@ from algo_trader.ml import (
     InsufficientTrainingDataError,
     IntParameterSpec,
     MetaFeatureSchema,
+    MetaModelArtifactIdentity,
+    MetaModelEvaluationIntegrityError,
     MetaModelTrainingConfig,
     MetaTrainingSample,
     MetaTrainingSource,
@@ -40,6 +51,7 @@ from algo_trader.ml import (
     evaluate_trade_meta_model,
     extract_meta_features,
     extract_meta_training_samples,
+    inspect_trade_meta_model_artifact,
     load_trade_meta_model,
     optimize_strategy_parameters,
     parameter_distance,
@@ -47,6 +59,7 @@ from algo_trader.ml import (
     save_trade_meta_model,
     train_trade_meta_model,
 )
+from algo_trader.ml.optimizer import _prepare_trial_parameters
 from algo_trader.oos import (
     OOSAuditContext,
     OOSRegistry,
@@ -68,6 +81,22 @@ MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 ZERO = Decimal("0")
 
 
+def model_identity(
+    *,
+    scope: str = "scope-a",
+    plan: str = "plan-a",
+    version: str = "meta-v1",
+    strategies: tuple[str, ...] = ("strategy-a",),
+) -> MetaModelArtifactIdentity:
+    return MetaModelArtifactIdentity(
+        research_scope_id=scope,
+        plan_id=plan,
+        model_version=version,
+        allowed_strategy_ids=strategies,
+        artifact_fingerprint="a" * 64,
+    )
+
+
 def at(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> datetime:
     return datetime(year, month, day, hour, minute, tzinfo=MARKET_TIMEZONE)
 
@@ -87,6 +116,7 @@ def registry(tmp_path: Path) -> OOSRegistry:
         create_oos_plan(
             research_scope_id="scope-a",
             plan_id="plan-a",
+            strategy_ids=("strategy-a",),
             data_start_date=date(2024, 1, 1),
             data_end_exclusive=date(2027, 1, 1),
             oos_windows=(
@@ -400,7 +430,14 @@ def test_oos_training_lifecycle_allows_only_development_or_training_allowed(
     with pytest.raises(PermissionError):
         extract_meta_training_samples(config, (source,), registry)
 
-    registry.register_test_result("scope-a", "plan-a", "w1", window_result, audit("test", 1))
+    registry.register_test_result(
+        "scope-a",
+        "plan-a",
+        "w1",
+        window_result,
+        audit("test", 1),
+        window_result.strategy_versions,
+    )
     with pytest.raises(PermissionError):
         extract_meta_training_samples(config, (source,), registry)
 
@@ -580,11 +617,20 @@ def test_native_artifact_round_trip_checksum_and_no_overwrite(
         backtest_result=training_result(),
     )
     model = train_trade_meta_model(training_config(), (source,), registry)
+    assert ML_ARCHITECTURE_VERSION == "2"
+    assert model.metadata.ml_architecture_version == "2"
     directory = save_trade_meta_model(model, tmp_path / "meta-v1")
     assert {path.name for path in directory.iterdir()} == {*ARTIFACT_FILES, "manifest.json"}
     first_record = source.backtest_result.actual_trade_records[0]
     signal = first_record.allocation_decision.candidate.order_intent.signal
     assert load_trade_meta_model(directory).score(signal) == model.score(signal)
+    identity = inspect_trade_meta_model_artifact(directory)
+    assert identity.research_scope_id == "scope-a"
+    assert identity.plan_id == "plan-a"
+    assert identity.model_version == "meta-v1"
+    assert identity.allowed_strategy_ids == ("strategy-a",)
+    assert len(identity.artifact_fingerprint) == 64
+    assert inspect_trade_meta_model_artifact(directory) == identity
     with pytest.raises(FileExistsError):
         save_trade_meta_model(model, directory)
 
@@ -592,6 +638,8 @@ def test_native_artifact_round_trip_checksum_and_no_overwrite(
     classifier.write_text(classifier.read_text(encoding="utf-8") + "tampered", encoding="utf-8")
     with pytest.raises(ModelArtifactIntegrityError, match="checksum"):
         load_trade_meta_model(directory)
+    with pytest.raises(ModelArtifactIntegrityError, match="checksum"):
+        inspect_trade_meta_model_artifact(directory)
 
 
 def test_meta_evaluation_uses_actual_and_shadow_and_fixed_bins() -> None:
@@ -631,7 +679,7 @@ def test_meta_evaluation_uses_actual_and_shadow_and_fixed_bins() -> None:
         shadow=True,
     )
     result = make_result(at(2024, 2, 1), at(2024, 2, 2), records=records, shadows=(shadow,))
-    evaluation = evaluate_trade_meta_model(result, "meta-v1")
+    evaluation = evaluate_trade_meta_model(result, model_identity())
     assert (evaluation.actual_labeled_count, evaluation.shadow_labeled_count) == (3, 1)
     assert evaluation.labeled_count == 4
     assert evaluation.brier_score == Decimal("0.075")
@@ -643,7 +691,7 @@ def test_meta_evaluation_uses_actual_and_shadow_and_fixed_bins() -> None:
     assert evaluation.size_return_monotonic is True
 
     one = make_result(at(2024, 2, 1), at(2024, 2, 2), records=(records[0],))
-    assert evaluate_trade_meta_model(one, "meta-v1").quality_return_monotonic is None
+    assert evaluate_trade_meta_model(one, model_identity()).quality_return_monotonic is None
 
 
 def test_meta_evaluation_verifies_optional_oos_provenance() -> None:
@@ -669,18 +717,303 @@ def test_meta_evaluation_verifies_optional_oos_provenance() -> None:
         strategy_versions=result.strategy_versions,
         ml_model_versions=result.ml_model_versions,
         result_fingerprint=fingerprint_backtest_result(result),
+        scope_strategy_ids=("strategy-a",),
+        tested_strategy_versions=result.strategy_versions,
         registration_audit=audit("evaluation"),
     )
     before = oos.model_dump()
-    evaluation = evaluate_trade_meta_model(result, "meta-v1", oos)
+    evaluation = evaluate_trade_meta_model(result, model_identity(), oos)
     assert evaluation.research_scope_id == "scope-a"
     assert oos.model_dump() == before
     with pytest.raises(ValueError, match="fingerprint"):
         evaluate_trade_meta_model(
             result,
-            "meta-v1",
+            model_identity(),
             oos.model_copy(update={"result_fingerprint": "tampered"}),
         )
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="scope"):
+        evaluate_trade_meta_model(
+            result,
+            model_identity(scope="another-scope"),
+            oos,
+        )
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="tested strategy"):
+        evaluate_trade_meta_model(
+            result,
+            model_identity(),
+            oos.model_copy(
+                update={"tested_strategy_versions": (("strategy-a", "2"),)}
+            ),
+        )
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="outside model"):
+        evaluate_trade_meta_model(
+            result,
+            model_identity(),
+            oos.model_copy(
+                update={"tested_strategy_versions": (("foreign-strategy", "1"),)}
+            ),
+        )
+
+
+def test_meta_evaluation_requires_composite_identity_and_rejects_version_collision() -> None:
+    allowed = make_record(1, Decimal("500"), at(2024, 2, 1, 9), model_version="shared")
+    collision = make_record(
+        2,
+        Decimal("500"),
+        at(2024, 2, 1, 10),
+        strategy_id="other-strategy",
+        model_version="shared",
+    )
+    result = make_result(
+        at(2024, 2, 1), at(2024, 2, 2), records=(allowed, collision)
+    )
+    with pytest.raises(TypeError, match="MetaModelArtifactIdentity"):
+        evaluate_trade_meta_model(result, "shared")  # type: ignore[arg-type]
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="outside"):
+        evaluate_trade_meta_model(result, model_identity(version="shared"))
+
+
+def request_result_for(
+    record: BacktestTradeRecord,
+    outcome: BacktestRequestOutcome,
+) -> BacktestRequestResult:
+    request = BacktestTradeRequest(candidate=record.allocation_decision.candidate)
+    completed = outcome is BacktestRequestOutcome.COMPLETED_ACTUAL
+    return BacktestRequestResult(
+        request=request,
+        outcome=outcome,
+        terminal_at=(
+            record.trade.exit_fill.timestamp
+            if completed
+            else request.candidate.order_intent.timestamp
+        ),
+        allocation_decision=record.allocation_decision,
+        trade_record=record if completed else None,
+    )
+
+
+def test_meta_evaluation_uses_real_request_results_and_ignores_other_versions() -> None:
+    actual = make_record(
+        20, Decimal("500"), at(2024, 2, 1, 9), model_version="meta-v1"
+    )
+    allowed_no_fill = make_record(
+        21, Decimal("500"), at(2024, 2, 1, 10), model_version="meta-v1"
+    )
+    unrelated = make_record(
+        22,
+        Decimal("500"),
+        at(2024, 2, 1, 11),
+        strategy_id="other-strategy",
+        model_version="other-model",
+    )
+    result = make_result(
+        at(2024, 2, 1),
+        at(2024, 2, 2),
+        records=(actual,),
+    ).model_copy(
+        update={
+            "request_results": (
+                request_result_for(actual, BacktestRequestOutcome.COMPLETED_ACTUAL),
+                request_result_for(
+                    allowed_no_fill,
+                    BacktestRequestOutcome.ALLOCATED_ENTRY_NOT_FILLED,
+                ),
+                request_result_for(
+                    unrelated,
+                    BacktestRequestOutcome.ALLOCATED_ENTRY_NOT_FILLED,
+                ),
+            ),
+            "strategy_versions": (("other-strategy", "1"), ("strategy-a", "1")),
+            "ml_model_versions": ("meta-v1", "other-model"),
+        }
+    )
+    evaluation = evaluate_trade_meta_model(result, model_identity())
+    assert evaluation.actual_labeled_count == 1
+    assert evaluation.allocated_entry_not_filled_count == 1
+
+
+def test_request_only_same_version_foreign_strategy_is_lineage_collision() -> None:
+    actual = make_record(
+        23, Decimal("500"), at(2024, 2, 1, 9), model_version="meta-v1"
+    )
+    foreign = make_record(
+        24,
+        Decimal("500"),
+        at(2024, 2, 1, 10),
+        strategy_id="foreign-strategy",
+        model_version="meta-v1",
+    )
+    result = make_result(
+        at(2024, 2, 1), at(2024, 2, 2), records=(actual,)
+    ).model_copy(
+        update={
+            "request_results": (
+                request_result_for(actual, BacktestRequestOutcome.COMPLETED_ACTUAL),
+                request_result_for(
+                    foreign,
+                    BacktestRequestOutcome.ALLOCATED_ENTRY_NOT_FILLED,
+                ),
+            ),
+            "strategy_versions": (("foreign-strategy", "1"), ("strategy-a", "1")),
+        }
+    )
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="outside"):
+        evaluate_trade_meta_model(result, model_identity())
+
+
+def oos_record_for_result(
+    result: BacktestRunResult,
+    *,
+    tested_strategy_versions: tuple[tuple[str, str], ...] = (("strategy-a", "1"),),
+) -> OOSTestRecord:
+    return OOSTestRecord(
+        research_scope_id="scope-a",
+        plan_id="plan-a",
+        window_id="w1",
+        backtest_run_id=result.run_id,
+        backtest_git_commit=result.git_commit,
+        backtester_version=result.backtester_version,
+        backtest_window_start=result.window_start,
+        backtest_window_end=result.window_end,
+        cost_policy_id=result.cost_policy_id,
+        brokerage_plan=result.brokerage_plan.value,
+        symbols=result.symbols,
+        scope_strategy_ids=("strategy-a",),
+        tested_strategy_versions=tested_strategy_versions,
+        strategy_versions=result.strategy_versions,
+        ml_model_versions=result.ml_model_versions,
+        result_fingerprint=fingerprint_backtest_result(result),
+        registration_audit=audit("zero-signal-evaluation"),
+    )
+
+
+def test_zero_signal_oos_attestation_evaluates_without_fabricated_records() -> None:
+    result = make_result(at(2024, 2, 1), at(2024, 2, 2))
+    evaluation = evaluate_trade_meta_model(
+        result,
+        model_identity(),
+        oos_record_for_result(result),
+    )
+    assert evaluation.labeled_count == 0
+    assert evaluation.actual_labeled_count == 0
+    assert evaluation.shadow_labeled_count == 0
+
+
+def test_empty_strategy_provenance_with_request_result_fails_oos_verification() -> None:
+    no_fill_record = make_record(
+        25, Decimal("500"), at(2024, 2, 1, 10), model_version="meta-v1"
+    )
+    result = make_result(at(2024, 2, 1), at(2024, 2, 2)).model_copy(
+        update={
+            "request_results": (
+                request_result_for(
+                    no_fill_record,
+                    BacktestRequestOutcome.ALLOCATED_ENTRY_NOT_FILLED,
+                ),
+            ),
+            "symbols": (no_fill_record.trade.signal.symbol,),
+            "ml_model_versions": ("meta-v1",),
+        }
+    )
+    with pytest.raises(MetaModelEvaluationIntegrityError, match="zero-signal"):
+        evaluate_trade_meta_model(
+            result,
+            model_identity(),
+            oos_record_for_result(result),
+        )
+
+
+def test_ml_owned_nested_values_are_detached_immutable_and_serializable() -> None:
+    caller = {"nested": [{"value": 1}], "unordered": {3, 1, 2}}
+    sample = MetaTrainingSample(
+        candidate_identity=(caller,),
+        signal_timestamp=at(2024, 2, 1, 9),
+        feature_values=(1.0,),
+        profitable=1,
+        net_return=Decimal("0.01"),
+        is_shadow=False,
+    )
+    caller["nested"][0]["value"] = 99
+    caller["unordered"].add(4)
+    stored = sample.candidate_identity[0]
+    assert stored["nested"][0]["value"] == 1
+    assert stored["unordered"] == (1, 2, 3)
+    with pytest.raises(TypeError):
+        stored["nested"][0]["value"] = 2
+    assert sample.model_dump(mode="python") == sample.model_dump(mode="python")
+    assert sample.model_dump(mode="json")["candidate_identity"][0]["nested"] == [
+        {"value": 1}
+    ]
+
+    baseline = {"threshold": 1.0, "mode": "base", "fixed": True}
+    values = optimizer_config(1).model_dump(mode="python")
+    values["baseline_parameters"] = baseline
+    config = StrategyOptimizerConfig(**values)
+    baseline["threshold"] = 9.0
+    assert config.baseline_parameters["threshold"] == 1.0
+    with pytest.raises(TypeError):
+        config.baseline_parameters["threshold"] = 2.0
+
+
+class ControlledTrial:
+    def __init__(self, values: dict[str, object]) -> None:
+        self.values = values
+
+    def suggest_categorical(self, name, choices):
+        del choices
+        return self.values[name]
+
+    def suggest_int(self, name, low, high, *, step, log):
+        del low, high, step, log
+        return self.values[name]
+
+    def suggest_float(self, name, low, high, *, step, log):
+        del low, high, step, log
+        return self.values[name]
+
+
+def test_optimizer_change_budget_uses_actual_values_after_sampling() -> None:
+    config = StrategyOptimizerConfig(
+        research_scope_id="scope-a",
+        plan_id="plan-a",
+        strategy_id="strategy-a",
+        baseline_parameters={"category": "base", "integer": 2, "floating": 1.0},
+        parameter_specs=(
+            CategoricalParameterSpec(
+                name="category", baseline_value="base", choices=("base", "other")
+            ),
+            IntParameterSpec(name="integer", baseline_value=2, low=1, high=3),
+            FloatParameterSpec(
+                name="floating", baseline_value=1.0, low=0.5, high=1.5, step=0.5
+            ),
+        ),
+        evaluation_ranges=optimizer_config(1).evaluation_ranges,
+        n_trials=1,
+        random_seed=1,
+        max_changed_parameters=1,
+        low_quality_threshold=0.5,
+    )
+    baseline_values = {
+        "change::category": True,
+        "value::category": "base",
+        "change::integer": True,
+        "value::integer": 2,
+        "change::floating": True,
+        "value::floating": 1.0,
+    }
+    parameters, changed, distance = _prepare_trial_parameters(
+        ControlledTrial(baseline_values), config  # type: ignore[arg-type]
+    )
+    assert parameters == config.baseline_parameters
+    assert changed == ()
+    assert distance == 0
+
+    two_changes = baseline_values | {
+        "value::category": "other",
+        "value::integer": 3,
+    }
+    with pytest.raises(optuna.TrialPruned, match="max_changed_parameters"):
+        _prepare_trial_parameters(ControlledTrial(two_changes), config)  # type: ignore[arg-type]
 
 
 def report_for_range(
@@ -866,6 +1199,8 @@ def test_optimizer_is_seeded_sparse_multiobjective_and_returns_pareto(
 ) -> None:
     evaluator = SyntheticEvaluator()
     result = optimize_strategy_parameters(optimizer_config(), evaluator, registry)
+    assert STRATEGY_OPTIMIZER_VERSION == "2"
+    assert result.optimizer_version == "2"
     assert result.objective_directions == OBJECTIVE_DIRECTIONS
     assert result.baseline_trial.trial_number == 0
     assert result.baseline_trial.parameters == {
@@ -887,6 +1222,15 @@ def test_optimizer_is_seeded_sparse_multiobjective_and_returns_pareto(
     assert result.baseline_trial.evaluation_window_count == 2
     assert result.pareto_trials
     assert all(len(trial.changed_parameter_names) <= 1 for trial in result.completed_trials)
+    assert all(
+        trial.changed_parameter_names
+        == tuple(
+            spec.name
+            for spec in optimizer_config().parameter_specs
+            if trial.parameters[spec.name] != spec.baseline_value
+        )
+        for trial in result.completed_trials
+    )
     assert len(result.completed_trials) < optimizer_config().n_trials
     assert len(evaluator.calls) == len(result.completed_trials)
     assert all(call["fixed"] is True for call in evaluator.calls)

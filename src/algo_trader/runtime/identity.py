@@ -47,7 +47,7 @@ def runtime_client_order_id(
         "leg": leg.value,
         "attempt": attempt,
         "runtime_session_id": runtime_session_id.strip(),
-        "runtime_version": "1",
+        "runtime_version": "2",
     }
     return f"NAT-RUNTIME-{hashlib.sha256(_canonical_json(payload)).hexdigest()}"
 

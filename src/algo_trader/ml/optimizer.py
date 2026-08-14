@@ -25,7 +25,7 @@ from algo_trader.ml.models import (
 from algo_trader.oos import OOSRegistry
 from algo_trader.reporting import ReportBundle
 
-STRATEGY_OPTIMIZER_VERSION = "1"
+STRATEGY_OPTIMIZER_VERSION = "2"
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 OBJECTIVE_DIRECTIONS = (
     "maximize",
@@ -100,22 +100,7 @@ def optimize_strategy_parameters(
     completed: dict[int, OptimizationTrialResult] = {}
 
     def objective(trial: optuna.Trial) -> tuple[float, ...]:
-        parameters = dict(config.baseline_parameters)
-        activated = 0
-        for spec in config.parameter_specs:
-            change = trial.suggest_categorical(f"change::{spec.name}", [False, True])
-            if not change:
-                continue
-            activated += 1
-            if activated > config.max_changed_parameters:
-                raise optuna.TrialPruned("trial exceeds max_changed_parameters")
-            parameters[spec.name] = _suggest_value(trial, spec)
-        changed = tuple(
-            spec.name
-            for spec in config.parameter_specs
-            if parameters[spec.name] != spec.baseline_value
-        )
-        distance = parameter_distance(parameters, config.parameter_specs)
+        parameters, changed, distance = _prepare_trial_parameters(trial, config)
         reports = evaluator.evaluate(MappingProxyType(parameters.copy()), config.evaluation_ranges)
         validated = _validate_reports(config, reports)
         values = _objective_values(validated, distance, config.low_quality_threshold)
@@ -162,6 +147,25 @@ def optimize_strategy_parameters(
         pareto_trials=pareto_trials,
         baseline_trial=completed[0],
     )
+
+
+def _prepare_trial_parameters(
+    trial: optuna.Trial,
+    config: StrategyOptimizerConfig,
+) -> tuple[dict[str, int | float | str | bool], tuple[str, ...], Decimal]:
+    parameters = dict(config.baseline_parameters)
+    for spec in config.parameter_specs:
+        change = trial.suggest_categorical(f"change::{spec.name}", [False, True])
+        if change:
+            parameters[spec.name] = _suggest_value(trial, spec)
+    changed = tuple(
+        spec.name
+        for spec in config.parameter_specs
+        if parameters[spec.name] != spec.baseline_value
+    )
+    if len(changed) > config.max_changed_parameters:
+        raise optuna.TrialPruned("trial exceeds max_changed_parameters")
+    return parameters, changed, parameter_distance(parameters, config.parameter_specs)
 
 
 def _suggest_value(

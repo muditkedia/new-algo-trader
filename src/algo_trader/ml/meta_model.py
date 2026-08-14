@@ -33,7 +33,7 @@ from algo_trader.ml.models import (
 )
 from algo_trader.oos import OOSRegistry, fingerprint_backtest_result
 
-ML_ARCHITECTURE_VERSION = "1"
+ML_ARCHITECTURE_VERSION = "2"
 SIZING_POLICY_ID = "quality-linear-half-up-v1"
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 

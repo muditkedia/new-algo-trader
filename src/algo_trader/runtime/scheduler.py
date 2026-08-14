@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, datetime, time
+from threading import Condition
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -34,6 +35,11 @@ class RuntimeScheduler:
         self.trading_calendar = trading_calendar
         self._scheduler = scheduler_factory(timezone=MARKET_TIMEZONE)
         self._misfire_grace_seconds = misfire_grace_seconds
+        self._shutdown_condition = Condition()
+        self._shutdown_started = False
+        self._shutdown_complete = False
+        self._shutdown_result: object = None
+        self._shutdown_error: BaseException | None = None
 
     @property
     def scheduler(self) -> object:
@@ -52,7 +58,7 @@ class RuntimeScheduler:
             ("market-open", session_times.market_open_time, self.service.market_open),
             ("entry-cutoff", session_times.entry_cutoff_time, self.service.close_entries),
             ("square-off", session_times.square_off_time, self.service.force_square_off),
-            ("shutdown", session_times.shutdown_time, self.service.shutdown),
+            ("shutdown", session_times.shutdown_time, self._scheduled_shutdown),
         )
         job_ids = []
         for suffix, wall_time, callback in callbacks:
@@ -73,8 +79,51 @@ class RuntimeScheduler:
     def start(self) -> None:
         self._scheduler.start()
 
-    def shutdown(self, *, wait: bool = True) -> None:
-        self._scheduler.shutdown(wait=wait)
+    def shutdown(self, *, wait: bool = True) -> object:
+        """Shut down the Runtime service and APScheduler exactly once, in order."""
+        return self._coordinate_shutdown(wait=wait, scheduled=False)
+
+    def _scheduled_shutdown(self) -> object:
+        return self._coordinate_shutdown(wait=False, scheduled=True)
+
+    def _coordinate_shutdown(self, *, wait: bool, scheduled: bool) -> object:
+        with self._shutdown_condition:
+            if self._shutdown_complete:
+                if scheduled:
+                    return self._shutdown_result
+                if self._shutdown_error is not None:
+                    raise self._shutdown_error
+                return self._shutdown_result
+            if self._shutdown_started:
+                if scheduled:
+                    return None
+                while not self._shutdown_complete:
+                    self._shutdown_condition.wait()
+                if self._shutdown_error is not None:
+                    raise self._shutdown_error
+                return self._shutdown_result
+            self._shutdown_started = True
+
+        result: object = None
+        service_error: BaseException | None = None
+        scheduler_error: BaseException | None = None
+        try:
+            result = self.service.shutdown()
+        except BaseException as error:
+            service_error = error
+        try:
+            self._scheduler.shutdown(wait=wait)
+        except BaseException as error:
+            scheduler_error = error
+
+        with self._shutdown_condition:
+            self._shutdown_result = result
+            self._shutdown_error = service_error or scheduler_error
+            self._shutdown_complete = True
+            self._shutdown_condition.notify_all()
+            if self._shutdown_error is not None:
+                raise self._shutdown_error
+            return self._shutdown_result
 
 
 def _at(day: date, wall_time: time) -> datetime:

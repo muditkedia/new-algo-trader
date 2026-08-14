@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -32,7 +32,7 @@ from algo_trader.reporting.models import (
     SymbolTradeMetrics,
 )
 
-REPORTING_VERSION = "1"
+REPORTING_VERSION = "2"
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
 ZERO = Decimal("0")
 
@@ -105,10 +105,15 @@ def _validate_result(
         raise ReportingIntegrityError("backtest window must have positive elapsed duration")
     if result.starting_capital <= 0:
         raise ReportingIntegrityError("starting_capital must be positive")
-    start_date = result.window_start.astimezone(MARKET_TIMEZONE).date()
-    end_date = result.window_end.astimezone(MARKET_TIMEZONE).date()
-    if any(day < start_date or day > end_date for day in context.trading_dates):
-        raise ReportingIntegrityError("all trading_dates must fall inside the backtest window")
+    window_start = result.window_start.astimezone(MARKET_TIMEZONE)
+    window_end = result.window_end.astimezone(MARKET_TIMEZONE)
+    for day in context.trading_dates:
+        day_start = datetime.combine(day, time.min, tzinfo=MARKET_TIMEZONE)
+        day_end = day_start + timedelta(days=1)
+        if not (day_start < window_end and day_end > window_start):
+            raise ReportingIntegrityError(
+                "every trading_date must intersect the half-open backtest window"
+            )
 
     actual = tuple(sorted(result.actual_trade_records, key=_record_sort_key))
     shadow = tuple(sorted(result.shadow_trade_records, key=_record_sort_key))

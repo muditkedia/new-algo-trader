@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_serializer,
+    model_validator,
+)
 
 from algo_trader.backtest import BacktestRunResult
 
@@ -15,12 +24,82 @@ NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 StrictDate = Annotated[date, Field(strict=True)]
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class FrozenMapping[K, V](dict[K, V]):
+    """Detached, deterministic immutable mapping used by ML-owned records."""
+
+    def __init__(self, values: Mapping[K, V]) -> None:
+        dict.__init__(
+            self,
+            sorted(values.items(), key=lambda item: (type(item[0]).__name__, repr(item[0]))),
+        )
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("FrozenMapping does not support mutation")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __repr__(self) -> str:
+        return f"FrozenMapping({dict(self)!r})"
+
+
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, FrozenMapping):
+        return value
+    if isinstance(value, Mapping):
+        return FrozenMapping({deepcopy(key): _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return tuple(
+            sorted(
+                (_deep_freeze(item) for item in value),
+                key=lambda item: (type(item).__name__, repr(item)),
+            )
+        )
+    if isinstance(value, BaseModel):
+        return value
+    try:
+        return deepcopy(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _deep_thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_deep_thaw(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return sorted((_deep_thaw(item) for item in value), key=repr)
+    return value
 
 
 class FrozenMLModel(BaseModel):
     """Validation policy for immutable ML-owned records."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def deeply_freeze(self) -> FrozenMLModel:
+        for name in type(self).model_fields:
+            object.__setattr__(self, name, _deep_freeze(getattr(self, name)))
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_frozen_values(self, handler: object) -> object:
+        return _deep_thaw(handler(self))  # type: ignore[operator]
 
 
 class MetaFeatureSchema(FrozenMLModel):
@@ -112,8 +191,8 @@ class MetaModelMetadata(FrozenMLModel):
     random_seed: int
     calibration_fraction: float
     calibration_cutoff: datetime
-    classifier_parameters: dict[str, bool | int | float | str | None]
-    regressor_parameters: dict[str, bool | int | float | str | None]
+    classifier_parameters: Mapping[str, bool | int | float | str | None]
+    regressor_parameters: Mapping[str, bool | int | float | str | None]
     calibration_coefficient: float
     calibration_intercept: float
     sizing_policy_id: NonEmptyStr
@@ -153,9 +232,17 @@ class SizeBucketMetrics(FrozenMLModel):
 
 
 class MetaModelEvaluation(FrozenMLModel):
-    """Read-only diagnostics over embedded actual and hypothetical scores."""
+    """Read-only diagnostics constrained by one verified artifact identity.
 
+    The fingerprint identifies the immutable artifact selected for evaluation; it
+    does not claim that legacy MLScore values cryptographically carry that hash.
+    """
+
+    research_scope_id: NonEmptyStr
+    plan_id: NonEmptyStr
     model_version: NonEmptyStr
+    allowed_strategy_ids: tuple[NonEmptyStr, ...]
+    artifact_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_backtest_fingerprint: NonEmptyStr
     labeled_count: int = Field(ge=0)
     actual_labeled_count: int = Field(ge=0)
@@ -174,9 +261,27 @@ class MetaModelEvaluation(FrozenMLModel):
     quality_return_monotonic: bool | None
     quality_win_rate_monotonic: bool | None
     size_return_monotonic: bool | None
-    research_scope_id: str | None = None
-    plan_id: str | None = None
     window_id: str | None = None
+
+
+class MetaModelArtifactIdentity(FrozenMLModel):
+    """Composite identity derived only from a checksum-verified artifact."""
+
+    research_scope_id: NonEmptyStr
+    plan_id: NonEmptyStr
+    model_version: NonEmptyStr
+    allowed_strategy_ids: tuple[NonEmptyStr, ...]
+    artifact_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_strategy_ids(self) -> MetaModelArtifactIdentity:
+        if not self.allowed_strategy_ids:
+            raise ValueError("allowed_strategy_ids must not be empty")
+        normalized = tuple(sorted(self.allowed_strategy_ids))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed_strategy_ids must be unique")
+        object.__setattr__(self, "allowed_strategy_ids", normalized)
+        return self
 
 
 class FloatParameterSpec(FrozenMLModel):
@@ -274,7 +379,7 @@ class StrategyOptimizerConfig(FrozenMLModel):
     research_scope_id: NonEmptyStr
     plan_id: NonEmptyStr
     strategy_id: NonEmptyStr
-    baseline_parameters: dict[str, int | float | str | bool]
+    baseline_parameters: Mapping[str, int | float | str | bool]
     parameter_specs: tuple[ParameterSpec, ...]
     evaluation_ranges: tuple[OptimizationEvaluationRange, ...]
     n_trials: int = Field(gt=0)
@@ -320,7 +425,7 @@ class OptimizationTrialResult(FrozenMLModel):
 
     trial_number: int = Field(ge=0)
     state: OptimizationTrialState
-    parameters: dict[str, int | float | str | bool]
+    parameters: Mapping[str, int | float | str | bool]
     changed_parameter_names: tuple[str, ...]
     parameter_distance: NonNegativeDecimal
     pf_score: NonNegativeDecimal

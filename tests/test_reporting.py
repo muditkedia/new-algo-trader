@@ -37,6 +37,7 @@ from algo_trader.portfolio import (
 )
 from algo_trader.reporting import (
     REPORT_TABLE_FILENAMES,
+    REPORTING_VERSION,
     ReportContext,
     ReportingIntegrityError,
     build_report,
@@ -222,11 +223,60 @@ def test_report_context_requires_explicit_aware_time_and_valid_trading_dates() -
             ReportContext(**(values | update))
 
 
+def test_trading_dates_must_intersect_half_open_backtest_window() -> None:
+    base = make_result(actual=(), shadow=(), ending_capital=Decimal("100000"))
+    partial = base.model_copy(update={"window_start": at(2, 12), "window_end": at(3, 0)})
+    assert build_report(
+        partial,
+        context().model_copy(update={"trading_dates": (date(2025, 1, 2),)}),
+    )
+    with pytest.raises(ReportingIntegrityError, match="intersect"):
+        build_report(
+            partial,
+            context().model_copy(update={"trading_dates": (date(2025, 1, 3),)}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("window_start", "window_end", "valid_dates", "invalid_dates"),
+    [
+        (at(1, 0), at(2, 0), (date(2025, 1, 1),), (date(2025, 1, 2),)),
+        (
+            at(1, 0),
+            at(2, 12),
+            (date(2025, 1, 1), date(2025, 1, 2)),
+            (date(2025, 1, 3),),
+        ),
+        (at(1, 12), at(2, 0), (date(2025, 1, 1),), (date(2025, 1, 2),)),
+    ],
+)
+def test_half_open_local_day_intersection_examples(
+    window_start: datetime,
+    window_end: datetime,
+    valid_dates: tuple[date, ...],
+    invalid_dates: tuple[date, ...],
+) -> None:
+    result = make_result(actual=(), shadow=(), ending_capital=Decimal("100000")).model_copy(
+        update={"window_start": window_start, "window_end": window_end}
+    )
+    assert build_report(
+        result, context().model_copy(update={"trading_dates": valid_dates})
+    )
+    for invalid in invalid_dates:
+        with pytest.raises(ReportingIntegrityError, match="intersect"):
+            build_report(
+                result,
+                context().model_copy(update={"trading_dates": (invalid,)}),
+            )
+
+
 def test_actual_metrics_reconcile_and_exclude_shadow_economics() -> None:
     report = build_report(make_result(), context())
     metrics = report.performance
 
     assert metrics.net_profit == Decimal("300")
+    assert REPORTING_VERSION == "2"
+    assert report.provenance.reporting_version == "2"
     assert metrics.ending_capital == Decimal("100300")
     assert metrics.actual_trade_count == 3
     assert (
@@ -439,6 +489,8 @@ def test_oos_provenance_is_verified_without_mutation() -> None:
         strategy_versions=result.strategy_versions,
         ml_model_versions=result.ml_model_versions,
         result_fingerprint=fingerprint,
+        scope_strategy_ids=tuple(strategy_id for strategy_id, _ in result.strategy_versions),
+        tested_strategy_versions=result.strategy_versions,
         registration_audit=OOSAuditContext(
             event_id="event",
             occurred_at=context().generated_at,
@@ -521,6 +573,18 @@ def test_matplotlib_visuals_are_headless_nonempty_and_close_figures(tmp_path: Pa
     }
     assert all(path.stat().st_size > 0 for path in paths)
     assert tuple(plt.get_fignums()) == before
+
+
+def test_visual_report_preflights_entire_batch_before_writing(tmp_path: Path) -> None:
+    report = build_report(make_result(), context())
+    directory = tmp_path / "visuals"
+    directory.mkdir()
+    collision = directory / "cost_composition.png"
+    collision.write_bytes(b"keep")
+    with pytest.raises(FileExistsError, match="already exists"):
+        write_visual_report(report, directory)
+    assert collision.read_bytes() == b"keep"
+    assert tuple(directory.iterdir()) == (collision,)
 
 
 def test_zero_trade_excel_and_visuals_do_not_fabricate_observations(tmp_path: Path) -> None:

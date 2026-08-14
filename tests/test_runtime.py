@@ -3,7 +3,7 @@ import os
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from threading import Event
+from threading import Condition, Event, Thread
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -47,6 +47,7 @@ from algo_trader.portfolio import (
 )
 from algo_trader.runtime import (
     DEFAULT_SMARTAPI_ENV_PATH,
+    RUNTIME_ARCHITECTURE_VERSION,
     Clock,
     ExplicitTradingDayCalendar,
     LiveExecutionGateway,
@@ -313,6 +314,7 @@ def test_clock_calendar_session_times_and_config_contract(tmp_path: Path) -> Non
     with pytest.raises(ValidationError, match="strictly increasing"):
         RuntimeSessionTimes(entry_cutoff_time=times.market_open_time)
     selected = config(tmp_path, mode=RuntimeMode.LIVE)
+    assert RUNTIME_ARCHITECTURE_VERSION == "2"
     assert selected.live_order_submission_enabled is False
     assert "secret" not in repr(selected).lower()
     with pytest.raises(ValidationError):
@@ -324,6 +326,16 @@ def test_clock_calendar_session_times_and_config_contract(tmp_path: Path) -> Non
             brokerage_plan=BrokeragePlan.PLUS,
             starting_capital=Decimal("1"),
         )
+    for invalid_timeout in (True, 0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValidationError):
+            RuntimeConfig(
+                mode=RuntimeMode.PAPER,
+                state_db_path=tmp_path / "timeout.duckdb",
+                brokerage_plan=BrokeragePlan.PLUS,
+                starting_capital=Decimal("1"),
+                stream_shutdown_timeout_seconds=invalid_timeout,
+            )
+    assert selected.model_dump()["stream_shutdown_timeout_seconds"] == 10.0
 
 
 def test_deterministic_runtime_identity_uses_session_candidate_and_leg() -> None:
@@ -1711,6 +1723,7 @@ def test_stream_lifecycle_is_explicit_single_and_cleanly_closed(tmp_path: Path) 
         runtime.connect_stream(instruments)
     assert runtime.shutdown(at(15, 35)) is RuntimePhase.STOPPED
     assert runtime._stream_thread is not None
+    assert runtime._stream_thread.daemon
     assert not runtime._stream_thread.is_alive()
     assert stream.calls == [
         ("configure", instruments),
@@ -1718,6 +1731,53 @@ def test_stream_lifecycle_is_explicit_single_and_cleanly_closed(tmp_path: Path) 
         ("unsubscribe", instruments),
         ("close", None),
     ]
+
+
+class StuckStream(FakeStream):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = Event()
+
+    def connect(self):
+        self.calls.append(("connect", None))
+        self.connected.set()
+        self.release.wait()
+
+    def close(self):
+        self.calls.append(("close", None))
+
+
+def test_stuck_stream_shutdown_is_bounded_audited_and_halted(tmp_path: Path) -> None:
+    selected_config = config(tmp_path).model_copy(
+        update={"stream_shutdown_timeout_seconds": 0.01}
+    )
+    store = RuntimeStateStore(selected_config.state_db_path)
+    stream = StuckStream()
+    runtime = RuntimeService(
+        runtime_session_id="stuck-stream-session",
+        trading_date=TRADING_DATE,
+        config=selected_config,
+        clock=FakeClock(at(9, 16)),
+        trading_calendar=ExplicitTradingDayCalendar([TRADING_DATE]),
+        state_store=store,
+        margin_provider=FixedMarginProvider(),
+        stream=stream,
+    )
+    runtime.start()
+    runtime.connect_stream((master().resolve("AAA"),))
+    assert stream.connected.wait(timeout=1)
+    assert runtime.shutdown(at(15, 35)) is RuntimePhase.HALTED
+    stream.release.set()
+    assert runtime._stream_thread is not None
+    runtime._stream_thread.join(timeout=1)
+    reopened = RuntimeStateStore(selected_config.state_db_path)
+    events = reopened.list_events("stuck-stream-session")
+    session = reopened.get_session("stuck-stream-session")
+    reopened.close()
+    assert session is not None and session.phase is RuntimePhase.HALTED
+    assert any(
+        event.event_type == "STREAM_THREAD_SHUTDOWN_TIMEOUT" for event in events
+    )
 
 
 def test_live_unknown_external_position_and_invalid_protective_geometry_halt(
@@ -2013,6 +2073,7 @@ class FakeScheduler:
         self.kwargs = kwargs
         self.jobs = {}
         self.started = False
+        self.shutdown_waits = []
 
     def add_job(self, callback, **kwargs):
         self.jobs[kwargs["id"]] = (callback, kwargs)
@@ -2021,6 +2082,7 @@ class FakeScheduler:
         self.started = True
 
     def shutdown(self, wait=True):
+        self.shutdown_waits.append(wait)
         self.started = False
 
 
@@ -2039,6 +2101,7 @@ class SchedulerService:
 
     def shutdown(self, **kwargs):
         self.calls.append(("shutdown", kwargs))
+        return RuntimePhase.STOPPED
 
 
 def test_scheduler_uses_explicit_date_jobs_deterministically() -> None:
@@ -2099,7 +2162,225 @@ def test_scheduler_keeps_scheduled_time_separate_from_actual_runtime_time(
         if event.event_type == "SQUARE_OFF_STARTED"
     )
     assert event.occurred_at == at(15, 22)
-    store.close()
+    clock.current = at(15, 37)
+    shutdown_job = scheduler.scheduler.jobs[
+        f"runtime:session-1:{TRADING_DATE.isoformat()}:shutdown"
+    ]
+    shutdown_job[0]()
+    reopened = RuntimeStateStore(config(tmp_path).state_db_path)
+    stopped = next(
+        event
+        for event in reopened.list_events("session-1")
+        if event.event_type == "SESSION_STOPPED"
+    )
+    reopened.close()
+    assert stopped.occurred_at == at(15, 37)
+    assert scheduler.scheduler.shutdown_waits == [False]
+
+
+def test_scheduler_owns_idempotent_manual_and_scheduled_teardown() -> None:
+    selected_service = SchedulerService()
+    owner = RuntimeScheduler(
+        selected_service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+    owner.configure_date(TRADING_DATE, RuntimeSessionTimes(), "session-1")
+    shutdown_job = owner.scheduler.jobs[
+        f"runtime:session-1:{TRADING_DATE.isoformat()}:shutdown"
+    ][0]
+    assert shutdown_job() is RuntimePhase.STOPPED
+    assert owner.shutdown() is RuntimePhase.STOPPED
+    assert selected_service.calls == [("shutdown", {})]
+    assert owner.scheduler.shutdown_waits == [False]
+
+    manual_service = SchedulerService()
+    manual = RuntimeScheduler(
+        manual_service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+    assert manual.shutdown() is RuntimePhase.STOPPED
+    assert manual.shutdown() is RuntimePhase.STOPPED
+    assert manual_service.calls == [("shutdown", {})]
+    assert manual.scheduler.shutdown_waits == [True]
+
+
+class BlockingSchedulerService(SchedulerService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+
+    def shutdown(self, **kwargs):
+        self.calls.append(("shutdown", kwargs))
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise RuntimeError("test service release was not signaled")
+        return RuntimePhase.STOPPED
+
+
+class CallbackAwareScheduler(FakeScheduler):
+    def __init__(self, callback_returned: Event, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.callback_returned = callback_returned
+
+    def shutdown(self, wait=True):
+        self.shutdown_waits.append(wait)
+        if wait and not self.callback_returned.wait(timeout=2):
+            raise RuntimeError("scheduled callback did not return before scheduler wait")
+        self.started = False
+
+
+class ObservableCondition(Condition):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_started = Event()
+
+    def wait(self, timeout=None):
+        self.wait_started.set()
+        return super().wait(timeout)
+
+
+def test_external_shutdown_owner_does_not_deadlock_scheduled_callback() -> None:
+    service = BlockingSchedulerService()
+    callback_returned = Event()
+    schedulers = []
+
+    def scheduler_factory(**kwargs):
+        scheduler = CallbackAwareScheduler(callback_returned, **kwargs)
+        schedulers.append(scheduler)
+        return scheduler
+
+    owner = RuntimeScheduler(
+        service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=scheduler_factory,
+    )
+    external_results = []
+    external_errors = []
+    scheduled_results = []
+
+    def run_external() -> None:
+        try:
+            external_results.append(owner.shutdown(wait=True))
+        except BaseException as error:
+            external_errors.append(error)
+
+    def run_scheduled() -> None:
+        try:
+            scheduled_results.append(owner._scheduled_shutdown())
+        finally:
+            callback_returned.set()
+
+    external_thread = Thread(target=run_external)
+    external_thread.start()
+    assert service.started.wait(timeout=1)
+    scheduled_thread = Thread(target=run_scheduled)
+    scheduled_thread.start()
+    scheduled_thread.join(timeout=1)
+    scheduled_returned_promptly = not scheduled_thread.is_alive()
+    service.release.set()
+    external_thread.join(timeout=2)
+    scheduled_thread.join(timeout=2)
+
+    assert scheduled_returned_promptly
+    assert not external_thread.is_alive()
+    assert not scheduled_thread.is_alive()
+    assert external_errors == []
+    assert external_results == [RuntimePhase.STOPPED]
+    assert scheduled_results == [None]
+    assert service.calls == [("shutdown", {})]
+    assert schedulers[0].shutdown_waits == [True]
+
+
+def test_scheduled_shutdown_owner_allows_external_caller_to_wait_safely() -> None:
+    service = BlockingSchedulerService()
+    owner = RuntimeScheduler(
+        service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+    condition = ObservableCondition()
+    owner._shutdown_condition = condition
+    scheduled_results = []
+    external_results = []
+    errors = []
+
+    def run_scheduled() -> None:
+        try:
+            scheduled_results.append(owner._scheduled_shutdown())
+        except BaseException as error:
+            errors.append(error)
+
+    def run_external() -> None:
+        try:
+            external_results.append(owner.shutdown())
+        except BaseException as error:
+            errors.append(error)
+
+    scheduled_thread = Thread(target=run_scheduled)
+    scheduled_thread.start()
+    assert service.started.wait(timeout=1)
+    external_thread = Thread(target=run_external)
+    external_thread.start()
+    assert condition.wait_started.wait(timeout=1)
+    service.release.set()
+    scheduled_thread.join(timeout=2)
+    external_thread.join(timeout=2)
+
+    assert not scheduled_thread.is_alive()
+    assert not external_thread.is_alive()
+    assert errors == []
+    assert scheduled_results == [RuntimePhase.STOPPED]
+    assert external_results == [RuntimePhase.STOPPED]
+    assert service.calls == [("shutdown", {})]
+    assert owner.scheduler.shutdown_waits == [False]
+
+
+def test_scheduler_stops_after_service_shutdown_error_and_reraises() -> None:
+    class FailingService(SchedulerService):
+        def shutdown(self, **kwargs):
+            super().shutdown(**kwargs)
+            raise RuntimeError("service failed")
+
+    selected_service = FailingService()
+    owner = RuntimeScheduler(
+        selected_service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FakeScheduler,
+    )
+    with pytest.raises(RuntimeError, match="service failed"):
+        owner.shutdown()
+    assert owner.scheduler.shutdown_waits == [True]
+    with pytest.raises(RuntimeError, match="service failed"):
+        owner.shutdown()
+    assert len(selected_service.calls) == 1
+
+
+def test_scheduler_preserves_service_error_when_scheduler_cleanup_also_fails() -> None:
+    class FailingService(SchedulerService):
+        def shutdown(self, **kwargs):
+            super().shutdown(**kwargs)
+            raise RuntimeError("primary service failure")
+
+    class FailingScheduler(FakeScheduler):
+        def shutdown(self, wait=True):
+            self.shutdown_waits.append(wait)
+            raise RuntimeError("secondary scheduler failure")
+
+    selected_service = FailingService()
+    owner = RuntimeScheduler(
+        selected_service,
+        ExplicitTradingDayCalendar([TRADING_DATE]),
+        scheduler_factory=FailingScheduler,
+    )
+    with pytest.raises(RuntimeError, match="primary service failure"):
+        owner.shutdown()
+    with pytest.raises(RuntimeError, match="primary service failure"):
+        owner.shutdown()
+    assert selected_service.calls == [("shutdown", {})]
+    assert owner.scheduler.shutdown_waits == [True]
 
 
 class ConnectivityBroker:

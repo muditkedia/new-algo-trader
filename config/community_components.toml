@@ -131,6 +131,7 @@ project_evidence = [
     "src/algo_trader/broker/market_data.py",
 ]
 license_status = "VENDOR_LICENSE_NOT_EXPLICITLY_DECLARED"
+redistribution_status = "REVIEW_REQUIRED_BEFORE_EXTERNAL_DISTRIBUTION"
 license_metadata_note = "Required vendor SDK; installed metadata does not declare a license."
 
 [[component]]
