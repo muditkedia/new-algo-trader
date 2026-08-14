@@ -76,16 +76,28 @@ def parse_instrument_master(payload: bytes | str | object) -> AngelOneInstrument
     for row in decoded:
         if not isinstance(row, Mapping):
             raise BrokerDataError("instrument master rows must be JSON objects")
-        name = _text(row, "name")
-        trading_symbol = _text(row, "symbol")
-        exchange_segment = _text(row, "exch_seg")
+
+        # OpenAPIScripMaster is a mixed all-instrument file. Filter irrelevant rows
+        # before requiring fields that are mandatory only for our NSE cash-equity
+        # subset. This prevents malformed/non-equity rows from aborting the entire
+        # master while preserving fail-closed validation for candidate NSE -EQ rows.
+        exchange_segment = str(row.get("exch_seg") or "").strip().upper()
+        trading_symbol = str(row.get("symbol") or "").strip()
         instrument_type = str(row.get("instrumenttype") or "").strip().upper()
-        if (
-            exchange_segment != "NSE"
-            or trading_symbol != f"{name}-EQ"
-            or instrument_type not in {"", "EQ"}
-        ):
+
+        if exchange_segment != "NSE":
             continue
+        if not trading_symbol.endswith("-EQ"):
+            continue
+        if instrument_type not in {"", "EQ"}:
+            continue
+
+        # From this point onward the row claims to be an NSE cash equity, so all
+        # required fields remain strict. Bad candidate rows must not be accepted.
+        name = _text(row, "name")
+        if trading_symbol != f"{name}-EQ":
+            continue
+
         lot_size = _positive_integer(row.get("lotsize"), "lotsize")
         raw_tick_size = _positive_decimal(row.get("tick_size"), "tick_size")
         instruments.append(
