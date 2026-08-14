@@ -35,6 +35,7 @@ from algo_trader.broker import (
     BrokerOrderAcknowledgement,
     BrokerOrderRequest,
     BrokerOrderState,
+    BrokerSystemicError,
     BrokerTradeFill,
     BrokerTransactionAction,
     HistoricalMarginRequirementProvider,
@@ -749,18 +750,154 @@ def test_live_margin_uses_broker_calculation_without_clamping(
     quote = provider.quote(selected, state)
     assert quote.provider_id == LIVE_MARGIN_PROVIDER_ID
     assert quote.required_margin == Decimal("12345.67")
-    payload = sdk.calls[-1][1][0]
+    payload = sdk.calls[-1][1]
     assert payload == {
-        "exchange": "NSE",
-        "productType": "INTRADAY",
-        "token": "2885",
-        "tradeType": expected_action,
-        "orderType": order_type.value,
-        "qty": "20",
-        "price": expected_price,
+        "positions": [
+            {
+                "exchange": "NSE",
+                "productType": "INTRADAY",
+                "token": "2885",
+                "tradeType": expected_action,
+                "orderType": order_type.value,
+                "qty": 20,
+                "price": int(expected_price),
+            }
+        ]
     }
     assert before == (selected.model_dump(), state.model_dump())
     assert len(sdk.calls) == 1
+
+
+def test_live_margin_preserves_fractional_limit_price_as_json_number() -> None:
+    sdk = FakeSDK()
+    selected = candidate(order_type=OrderType.LIMIT).model_copy(
+        update={
+            "order_intent": candidate(order_type=OrderType.LIMIT).order_intent.model_copy(
+                update={"limit_price": Decimal("2500.25")}
+            )
+        }
+    )
+
+    AngelOneLiveMarginProvider(sdk, instrument_master()).quote(
+        selected,
+        PortfolioState(),
+    )
+
+    assert sdk.calls[-1][1]["positions"][0]["price"] == 2500.25
+
+
+def test_live_margin_sdk_exception_is_sanitized_and_systemic() -> None:
+    class FailingSDK(FakeSDK):
+        def getMarginApi(self, payload):
+            self.calls.append(("getMarginApi", copy.deepcopy(payload)))
+            raise TypeError(
+                "Authorization: Bearer jwt-secret; token=2885; payload={'positions': []}"
+            )
+
+    sdk = FailingSDK()
+    with pytest.raises(BrokerSystemicError) as captured:
+        AngelOneLiveMarginProvider(sdk, instrument_master()).quote(
+            candidate(),
+            PortfolioState(),
+        )
+
+    detail = str(captured.value)
+    assert "TypeError" in detail
+    assert "sensitive detail redacted" in detail
+    assert "jwt-secret" not in detail
+    assert "2885" not in detail
+    assert "positions" not in detail
+    assert captured.value.__cause__ is None
+    assert len(sdk.calls) == 1
+
+
+def test_live_margin_declared_failure_exposes_only_safe_status_fields() -> None:
+    sdk = FakeSDK()
+    sdk.margin_response = {
+        "status": False,
+        "errorcode": "AB4022",
+        "message": "Null or Empty Margin Data",
+        "data": {"authorization": "secret"},
+    }
+
+    with pytest.raises(BrokerApiError) as captured:
+        AngelOneLiveMarginProvider(sdk, instrument_master()).quote(
+            candidate(),
+            PortfolioState(),
+        )
+
+    detail = str(captured.value)
+    assert "status=False" in detail
+    assert "errorcode=AB4022" in detail
+    assert "message=Null or Empty Margin Data" in detail
+    assert "authorization" not in detail
+    assert "secret" not in detail
+
+
+def test_margin_snapshot_capture_fails_fast_on_first_systemic_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_strategy1_development_backtest as runner
+
+    class Instrument:
+        lot_size = 1
+
+    class Master:
+        def resolve(self, symbol):
+            return Instrument()
+
+    class Quote:
+        ltp = Decimal("100")
+
+    class Broker:
+        def __init__(self) -> None:
+            self.ltp_calls = 0
+            self.logout_calls = 0
+
+        def authenticate(self, credentials, captured_at):
+            return object()
+
+        def _require_sdk(self):
+            return object()
+
+        def get_ltp(self, symbol, captured_at):
+            self.ltp_calls += 1
+            return Quote()
+
+        def logout(self, session):
+            self.logout_calls += 1
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def quote(self, candidate, state):
+            self.calls += 1
+            raise BrokerSystemicError("ConnectionError: service unavailable")
+
+    broker = Broker()
+    provider = Provider()
+    monkeypatch.setattr(
+        runner,
+        "required_margin_pairs",
+        lambda requests: {("AAA", Side.LONG), ("BBB", Side.SHORT)},
+    )
+    monkeypatch.setattr(runner, "latest_margin_snapshot", lambda: None)
+    monkeypatch.setattr(runner, "load_smartapi_credentials", object)
+    monkeypatch.setattr(runner, "fetch_instrument_master", Master)
+    monkeypatch.setattr(runner, "AngelOneBroker", lambda instrument_master: broker)
+    monkeypatch.setattr(
+        runner,
+        "AngelOneLiveMarginProvider",
+        lambda sdk, instrument_master: provider,
+    )
+
+    with pytest.raises(RuntimeError, match="first representative shared/systemic"):
+        runner.capture_or_expand_margin_snapshot(requests=[], captured_at=at(12))
+
+    assert provider.calls == 1
+    assert broker.ltp_calls == 1
+    assert broker.logout_calls == 1
 
 
 @pytest.mark.parametrize("value", [None, "0", "-1", "NaN", "Infinity", "bad"])

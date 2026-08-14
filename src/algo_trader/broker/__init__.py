@@ -19,6 +19,7 @@ from algo_trader.broker.exceptions import (
     BrokerDataError,
     BrokerError,
     BrokerInstrumentError,
+    BrokerSystemicError,
 )
 from algo_trader.broker.instruments import (
     ANGEL_ONE_INSTRUMENT_MASTER_URL,
@@ -93,6 +94,7 @@ __all__ = [
     "BrokerFunds",
     "BrokerInstrument",
     "BrokerInstrumentError",
+    "BrokerSystemicError",
     "BrokerMarketTick",
     "BrokerOrderAcknowledgement",
     "BrokerOrderRequest",

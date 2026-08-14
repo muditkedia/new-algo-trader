@@ -13,6 +13,10 @@ class BrokerApiError(BrokerError):
     """A broker operation returned a declared failure."""
 
 
+class BrokerSystemicError(BrokerApiError):
+    """A shared broker/API failure for which repeating equivalent calls is unsafe."""
+
+
 class BrokerDataError(BrokerError):
     """A broker response could not be normalized safely."""
 

@@ -11,7 +11,11 @@ from importlib.metadata import version
 from pathlib import Path
 
 from algo_trader.broker.angel_one import ANGEL_PRODUCT_TYPE, entry_action
-from algo_trader.broker.exceptions import BrokerApiError, BrokerDataError
+from algo_trader.broker.exceptions import (
+    BrokerApiError,
+    BrokerDataError,
+    BrokerSystemicError,
+)
 from algo_trader.broker.instruments import AngelOneInstrumentMaster
 from algo_trader.broker.models import (
     BROKER_ARCHITECTURE_VERSION,
@@ -52,30 +56,51 @@ class AngelOneLiveMarginProvider:
             raise TypeError("state must be a PortfolioState")
         order = candidate.order_intent
         instrument = self._instrument_master.resolve(order.signal.symbol)
-        payload = [
-            {
-                "exchange": instrument.exchange.value,
-                "productType": ANGEL_PRODUCT_TYPE,
-                "token": instrument.symbol_token,
-                "tradeType": entry_action(order.signal.side).value,
-                "orderType": order.order_type.value,
-                "qty": str(order.quantity),
-                "price": (
-                    "0"
-                    if order.order_type is OrderType.MARKET
-                    else format(order.limit_price, "f")
-                ),
-            }
-        ]
+        payload = {
+            "positions": [
+                {
+                    "exchange": instrument.exchange.value,
+                    "productType": ANGEL_PRODUCT_TYPE,
+                    "token": instrument.symbol_token,
+                    "tradeType": entry_action(order.signal.side).value,
+                    "orderType": order.order_type.value,
+                    "qty": order.quantity,
+                    "price": (
+                        0
+                        if order.order_type is OrderType.MARKET
+                        else _json_number(order.limit_price)
+                    ),
+                }
+            ]
+        }
         try:
             response = self._sdk.getMarginApi(payload)
         except Exception as error:
-            raise BrokerApiError("Angel One live-margin operation failed") from error
+            raise BrokerSystemicError(
+                "Angel One live-margin operation failed: "
+                + _safe_exception_summary(error)
+            ) from None
         if not isinstance(response, Mapping):
             raise BrokerDataError("Angel One live-margin response must be an object")
         if response.get("status") is not True:
-            message = str(response.get("message") or "broker declared failure")
-            raise BrokerApiError(f"Angel One live-margin request failed: {message}")
+            raw_errorcode = response.get("errorcode")
+            raw_message = response.get("message")
+            status = _safe_diagnostic_text(response.get("status"), "MISSING")
+            errorcode = _safe_diagnostic_text(raw_errorcode, "UNSPECIFIED")
+            message = _safe_diagnostic_text(
+                raw_message,
+                "broker declared failure",
+            )
+            error_type = (
+                BrokerSystemicError
+                if _is_clearly_systemic(raw_errorcode, raw_message)
+                else BrokerApiError
+            )
+            raise error_type(
+                "Angel One live-margin request failed: "
+                f"status={status} "
+                f"errorcode={errorcode} message={message}"
+            )
         data = response.get("data")
         if not isinstance(data, Mapping) or "totalMarginRequired" not in data:
             raise BrokerDataError("Angel One live-margin data is missing totalMarginRequired")
@@ -219,6 +244,63 @@ def _positive_decimal(value: object, context: str) -> Decimal:
     if not result.is_finite() or result <= 0:
         raise BrokerDataError(f"{context} must be finite and positive")
     return result
+
+
+def _json_number(value: Decimal | None) -> int | float:
+    if value is None:
+        raise BrokerDataError("LIMIT margin request requires limit_price")
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
+def _safe_exception_summary(error: Exception) -> str:
+    return f"{type(error).__name__}: {_safe_diagnostic_text(str(error), 'no detail')}"
+
+
+def _safe_diagnostic_text(value: object, fallback: str) -> str:
+    raw_text = fallback if value is None else str(value)
+    text = " ".join(raw_text.split()) or fallback
+    lowered = text.lower()
+    sensitive_markers = (
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "client_code",
+        "feedtoken",
+        "refreshtoken",
+        "jwt",
+        "password",
+        "privatekey",
+        "totp",
+        "token",
+    )
+    if any(marker in lowered for marker in sensitive_markers) or any(
+        marker in text for marker in ("{", "}", "[", "]")
+    ):
+        return "[sensitive detail redacted]"
+    return text[:300] + ("..." if len(text) > 300 else "")
+
+
+def _is_clearly_systemic(errorcode: object, message: object) -> bool:
+    detail = f"{errorcode} {message}".lower()
+    return any(
+        marker in detail
+        for marker in (
+            "access denied",
+            "authentication",
+            "forbidden",
+            "internal server",
+            "rate limit",
+            "service unavailable",
+            "session",
+            "timeout",
+            "token",
+            "too many requests",
+            "unauthorized",
+        )
+    )
 
 
 def _canonical_json(value: object) -> str:
