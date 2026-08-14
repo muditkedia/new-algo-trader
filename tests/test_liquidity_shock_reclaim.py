@@ -637,9 +637,23 @@ def test_runner_real_causality_preflight_is_non_vacuous() -> None:
             assert symbol == "TEST"
             return extended.clone()
 
+    allowed_end_exclusive = extended["timestamp"].item(-1).date() + timedelta(days=1)
+    late_start = datetime.combine(
+        allowed_end_exclusive + timedelta(days=1),
+        time(9, 15),
+        tzinfo=IST,
+    )
     report = run_real_causality_gate(
         store=Store(),  # type: ignore[arg-type]
         coverages=(
+            # A later-listed symbol must be ignored before calling load_candles;
+            # otherwise its first timestamp is on/after the allowed history cutoff.
+            SymbolCoverage(
+                symbol="LATE",
+                first_timestamp=late_start,
+                last_timestamp=late_start + timedelta(days=90),
+                row_count=extended.height,
+            ),
             SymbolCoverage(
                 symbol="TEST",
                 first_timestamp=extended["timestamp"].item(0),
@@ -648,7 +662,7 @@ def test_runner_real_causality_preflight_is_non_vacuous() -> None:
             ),
         ),
         strategy=LiquidityShockReclaimStrategy(),
-        allowed_end_exclusive=extended["timestamp"].item(-1).date() + timedelta(days=1),
+        allowed_end_exclusive=allowed_end_exclusive,
     )
     assert report.full_signal_count >= 1
     assert report.tested_prefix_count > 2

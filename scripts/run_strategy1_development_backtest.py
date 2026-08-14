@@ -455,6 +455,8 @@ def run_real_causality_gate(
         if (
             coverage.symbol in excluded
             or coverage.first_timestamp is None
+            or coverage.last_timestamp is None
+            or coverage.first_timestamp >= allowed_end
             or coverage.row_count < strategy.warmup_bars + 3
         ):
             continue
