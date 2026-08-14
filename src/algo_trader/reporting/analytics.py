@@ -67,14 +67,69 @@ def _quality(record: BacktestTradeRecord) -> Decimal:
     return Decimal(str(record.trade.ml_score.quality_score))
 
 
-def _record_sort_key(record: BacktestTradeRecord) -> tuple[object, ...]:
-    trade = record.trade
-    identity = record.allocation_identity
+def _identity_sort_key(identity) -> tuple[object, ...]:
+    """Mirror the backtester allocation-identity ordering exactly."""
     return (
-        trade.exit_fill.timestamp,
-        trade.entry_fill.timestamp,
-        *(value.value if hasattr(value, "value") else value for value in identity),
+        identity[0],
+        identity[1],
+        identity[2],
+        identity[3].value,
+        identity[4],
+        identity[5],
+        identity[6].value,
+        int(identity[7] is not None),
+        identity[7] if identity[7] is not None else ZERO,
+        identity[8],
+        identity[9],
     )
+
+
+def _record_sort_key(record: BacktestTradeRecord) -> tuple[object, ...]:
+    """Use the same realized-trade order as HistoricalBacktester."""
+    return (
+        record.trade.exit_fill.timestamp,
+        _identity_sort_key(record.allocation_identity),
+    )
+
+
+def _realization_groups(
+    records: tuple[BacktestTradeRecord, ...],
+) -> tuple[tuple[datetime, Decimal], ...]:
+    """Reproduce HistoricalBacktester's timestamp-group capital realization arithmetic.
+
+    Decimal arithmetic is context-sensitive and therefore not associative. The
+    backtester intentionally realizes all exits sharing one timestamp as a group,
+    ordered by allocation identity, then applies that group P&L to capital. Reporting
+    must use that identical reduction path instead of independently flattening or
+    reordering trade P&L, otherwise exact reconciliation can fail by rounding dust.
+    """
+    by_timestamp: dict[datetime, list[BacktestTradeRecord]] = defaultdict(list)
+    for record in records:
+        by_timestamp[record.trade.exit_fill.timestamp].append(record)
+
+    groups: list[tuple[datetime, Decimal]] = []
+    for timestamp in sorted(by_timestamp):
+        ordered = sorted(
+            by_timestamp[timestamp],
+            key=lambda record: _identity_sort_key(record.allocation_identity),
+        )
+        groups.append(
+            (
+                timestamp,
+                _sum(record.trade.net_pnl for record in ordered),
+            )
+        )
+    return tuple(groups)
+
+
+def _realized_ending_capital(
+    records: tuple[BacktestTradeRecord, ...],
+    starting_capital: Decimal,
+) -> Decimal:
+    capital = starting_capital
+    for _, group_pnl in _realization_groups(records):
+        capital += group_pnl
+    return capital
 
 
 def _profit_factor(records: tuple[BacktestTradeRecord, ...]) -> ProfitFactor:
@@ -122,10 +177,10 @@ def _validate_result(
     if any(not record.trade.is_shadow for record in shadow):
         raise ReportingIntegrityError("shadow_trade_records must contain only shadow trades")
 
-    actual_net_pnl = _sum(record.trade.net_pnl for record in actual)
-    if result.starting_capital + actual_net_pnl != result.ending_capital:
+    realized_ending_capital = _realized_ending_capital(actual, result.starting_capital)
+    if realized_ending_capital != result.ending_capital:
         raise ReportingIntegrityError(
-            "starting_capital plus actual net P&L must equal ending_capital exactly"
+            "backtester realization groups must reconcile exactly to ending_capital"
         )
     trade_costs = _sum(record.trade.total_costs for record in actual)
     retained_costs = _sum(record.round_trip_cost_breakdown.total for record in actual)
@@ -242,13 +297,9 @@ def _equity_curve(
             cumulative_net_pnl=ZERO,
         )
     ]
-    by_timestamp: dict[datetime, list[BacktestTradeRecord]] = defaultdict(list)
-    for record in records:
-        by_timestamp[record.trade.exit_fill.timestamp].append(record)
-    for timestamp in sorted(by_timestamp):
-        group_pnl = _sum(record.trade.net_pnl for record in by_timestamp[timestamp])
-        cumulative += group_pnl
+    for timestamp, group_pnl in _realization_groups(records):
         capital += group_pnl
+        cumulative = capital - result.starting_capital
         peak = max(peak, capital)
         drawdown = peak - capital
         points.append(
@@ -276,12 +327,22 @@ def _daily_performance(
     for record in records:
         day = record.trade.exit_fill.timestamp.astimezone(MARKET_TIMEZONE).date()
         grouped[day].append(record)
+
+    groups_by_day: dict[object, list[Decimal]] = defaultdict(list)
+    for timestamp, group_pnl in _realization_groups(records):
+        day = timestamp.astimezone(MARKET_TIMEZONE).date()
+        groups_by_day[day].append(group_pnl)
+
     cumulative = ZERO
+    realized_capital = result.starting_capital
     rows = []
     for day in context.trading_dates:
-        day_records = tuple(grouped[day])
-        net_pnl = _sum(record.trade.net_pnl for record in day_records)
-        cumulative += net_pnl
+        day_records = tuple(sorted(grouped[day], key=_record_sort_key))
+        day_start_capital = realized_capital
+        for group_pnl in groups_by_day[day]:
+            realized_capital += group_pnl
+        cumulative = realized_capital - result.starting_capital
+        net_pnl = realized_capital - day_start_capital
         returns = tuple(record.trade.net_return for record in day_records)
         rows.append(
             DailyPerformance(
@@ -294,7 +355,7 @@ def _daily_performance(
                 total_costs=_sum(record.trade.total_costs for record in day_records),
                 net_pnl=net_pnl,
                 cumulative_net_pnl=cumulative,
-                realized_end_capital=result.starting_capital + cumulative,
+                realized_end_capital=realized_capital,
                 average_trade_net_return=_mean(returns),
             )
         )
